@@ -10,6 +10,7 @@ export interface Project {
   id: string;
   name: string;
   path: string;
+  url?: string;
   description?: string;
   createdAt: string;
 }
@@ -19,7 +20,7 @@ export interface Instruction {
   teamId: string;
   projectId?: string;
   content: string;
-  status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed';
+  status: 'pending' | 'acknowledged' | 'executing' | 'clarifying' | 'done' | 'failed';
   createdAt: string;
   acknowledgedAt?: string;
 }

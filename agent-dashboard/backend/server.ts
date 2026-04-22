@@ -7,8 +7,12 @@ import { join, basename, dirname } from 'path';
 import { existsSync } from 'fs';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { initNotion, isNotionEnabled, createTaskTicket, updateTicketStatus, appendAgentReport, checkAgentTodo } from './notion.js';
 
 dotenv.config();
+
+// Initialize Notion if configured
+initNotion(process.env.NOTION_TOKEN, process.env.NOTION_DATABASE_ID);
 
 const app = express();
 const httpServer = createServer(app);
@@ -41,6 +45,7 @@ interface Project {
   id: string;
   name: string;
   path: string;
+  url?: string;
   description?: string;
   createdAt: string;
 }
@@ -50,9 +55,21 @@ interface Instruction {
   teamId: string;
   projectId?: string;
   content: string;
-  status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed';
+  status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed' | 'clarifying';
   createdAt: string;
   acknowledgedAt?: string;
+  notionPageId?: string;
+  clarifyingQuestions?: string;
+}
+
+interface AgentReport {
+  agentName: string;
+  role: string;
+  task: string;
+  status: string;
+  reasoning: string;
+  filesChanged: string[];
+  summary: string;
 }
 
 interface AgentResult {
@@ -63,6 +80,7 @@ interface AgentResult {
   exitCode: number | null;
   startedAt: string;
   completedAt: string;
+  report?: AgentReport;
 }
 
 interface Agent {
@@ -472,19 +490,20 @@ interface OrchestratorPlan {
   }[];
 }
 
-// Analyze task and compose the right team from the plugin catalog
-async function composeTeam(team: Team, instruction: string, projectPath: string): Promise<void> {
-  // Build a condensed catalog of available agents (grouped by plugin, top 60 to fit in context)
+// Get agent recommendations from Claude (does NOT apply them)
+async function getAgentRecommendations(
+  team: Team, instruction: string, projectPath: string
+): Promise<{ name: string; plugin: string; reason: string; model: string }[]> {
   const catalog = availableAgents
     .map(a => `${a.name} (${a.plugin}): ${a.description.substring(0, 80)}`)
     .join('\n');
 
   const currentRoles = team.agents.map(a => a.role);
   const currentList = currentRoles.length > 0
-    ? `Current team members: ${currentRoles.join(', ')}`
-    : 'Current team: empty';
+    ? `Current team members already assigned: ${currentRoles.join(', ')}`
+    : 'Current team: empty — recommend all needed agents';
 
-  const prompt = `You are a team composition expert. Given a task and a catalog of available agents, decide which agents are needed.
+  const prompt = `You are a team composition expert. Given a task and a catalog of available agents, recommend which agents are needed.
 
 Task: ${instruction}
 
@@ -494,18 +513,14 @@ Available agents catalog:
 ${catalog}
 
 Respond with ONLY valid JSON (no markdown, no backticks):
-{
-  "add": [{"name": "agent-name-from-catalog", "reason": "why needed"}],
-  "remove": [{"name": "current-role-to-remove", "reason": "why not needed"}],
-  "keep": ["current-role-to-keep"]
-}
+{"agents":[{"name":"agent-name-from-catalog","plugin":"plugin-name","reason":"one sentence why this agent is needed"}]}
 
 Rules:
-- Add agents that are essential for the task but missing from the team
-- Remove agents that are clearly irrelevant to this specific task
-- Keep agents that are useful
-- Be selective: 3-6 agents total is ideal, don't add more than needed
-- Use exact agent names from the catalog`;
+- Only recommend agents that are essential for THIS specific task
+- 3-6 agents is ideal, don't over-staff
+- Use exact agent names from the catalog
+- Include agents already on the team if they should stay
+- Don't include agents that aren't relevant`;
 
   return new Promise((resolve) => {
     const proc = spawn('claude', ['--print', '--model', 'haiku'], {
@@ -518,68 +533,67 @@ Rules:
 
     let out = '';
     proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    proc.stderr?.on('data', (_d: Buffer) => { /* ignore stderr */ });
+    proc.stderr?.on('data', () => {});
 
     proc.on('close', () => {
       try {
-        const jsonMatch = out.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) { resolve(); return; }
-
-        const composition = JSON.parse(jsonMatch[0]) as {
-          add?: { name: string; reason: string }[];
-          remove?: { name: string; reason: string }[];
-          keep?: string[];
-        };
-
-        // Add recommended agents
-        if (composition.add) {
-          for (const rec of composition.add) {
-            // Skip if already on team
-            if (team.agents.some(a => a.role === rec.name)) continue;
-
-            const catalogEntry = availableAgents.find(a => a.name === rec.name);
-            if (!catalogEntry) continue;
-
-            const model = catalogEntry.model === 'opus' ? 'claude-opus-4-6'
-              : catalogEntry.model === 'haiku' ? 'claude-haiku-4-5-20251001'
-              : 'claude-sonnet-4-6';
-
-            const displayName = rec.name.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-            const newAgent: Agent = {
-              id: `agent-${Math.random().toString(36).substring(2, 11)}`,
-              name: displayName,
-              role: rec.name,
-              status: 'idle',
-              progress: 0,
-              model,
-              plugin: catalogEntry.plugin
-            };
-            team.agents.push(newAgent);
-            addLog(team.id, newAgent.id, 'info', `Orchestrator auto-added ${displayName} (${catalogEntry.plugin}): ${rec.reason}`);
+        const match = out.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (parsed.agents && Array.isArray(parsed.agents)) {
+            resolve(parsed.agents.map((a: any) => {
+              const entry = availableAgents.find(av => av.name === a.name);
+              return {
+                name: a.name,
+                plugin: a.plugin || entry?.plugin || 'unknown',
+                reason: a.reason || '',
+                model: entry?.model === 'opus' ? 'claude-opus-4-6'
+                  : entry?.model === 'haiku' ? 'claude-haiku-4-5-20251001'
+                  : 'claude-sonnet-4-6'
+              };
+            }).filter((a: any) => availableAgents.some(av => av.name === a.name)));
+            return;
           }
         }
-
-        // Remove irrelevant agents (only idle ones, don't kill working agents)
-        if (composition.remove) {
-          for (const rec of composition.remove) {
-            const idx = team.agents.findIndex(a => a.role === rec.name && a.status === 'idle');
-            if (idx >= 0) {
-              const removed = team.agents.splice(idx, 1)[0];
-              addLog(team.id, undefined, 'info', `Orchestrator removed ${removed.name}: ${rec.reason}`);
-            }
-          }
-        }
-
-        io.emit('team:updated', team);
-      } catch { /* ignore parse errors, keep team as-is */ }
-      resolve();
+      } catch {}
+      resolve([]);
     });
-
-    proc.on('error', () => resolve());
-
-    // Timeout after 30s
-    setTimeout(() => { try { proc.kill(); } catch {} resolve(); }, 30000);
+    proc.on('error', () => resolve([]));
+    setTimeout(() => { try { proc.kill(); } catch {} resolve([]); }, 30000);
   });
+}
+
+// Apply confirmed agent selections to the team
+function applyAgentSelections(
+  team: Team,
+  selectedAgents: { name: string; plugin: string; model: string }[]
+) {
+  // Remove agents not in the selection (only idle ones)
+  const selectedRoles = new Set(selectedAgents.map(a => a.name));
+  team.agents = team.agents.filter(a => a.status !== 'idle' || selectedRoles.has(a.role));
+
+  // Add new agents
+  for (const sel of selectedAgents) {
+    if (team.agents.some(a => a.role === sel.name)) continue;
+
+    const catalogEntry = availableAgents.find(a => a.name === sel.name);
+    if (!catalogEntry) continue;
+
+    const displayName = sel.name.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    const newAgent: Agent = {
+      id: `agent-${Math.random().toString(36).substring(2, 11)}`,
+      name: displayName,
+      role: sel.name,
+      status: 'idle',
+      progress: 0,
+      model: sel.model || 'claude-sonnet-4-6',
+      plugin: catalogEntry.plugin
+    };
+    team.agents.push(newAgent);
+    addLog(team.id, newAgent.id, 'info', `Added ${displayName} (${catalogEntry.plugin})`);
+  }
+
+  io.emit('team:updated', team);
 }
 
 // Run Claude to create an execution plan
@@ -701,21 +715,253 @@ function executePhase(
   });
 }
 
+// Analyze task and ask clarifying questions if needed
+async function analyzeForClarification(team: Team, instruction: string, projectPath: string): Promise<string | null> {
+  const agentList = team.agents.map(a => `- ${a.name} (${a.role})`).join('\n');
+
+  const prompt = `You are a project orchestrator. A user wants their agent team to execute a task. Before proceeding, analyze the instruction for ambiguity.
+
+Task: ${instruction}
+
+Team:
+${agentList || '(will be auto-composed)'}
+
+Review the task and determine if you need clarification. Consider:
+- Is the scope clear? (which files, which features, what boundaries?)
+- Are there technical decisions that need input? (framework choice, API design, etc.)
+- Could this be interpreted multiple ways?
+- Is there anything that could go wrong without more context?
+
+If the task is clear enough to proceed, respond with ONLY: CLEAR
+
+If you need clarification, respond with your questions in a friendly, concise format. Number each question. Keep it to 2-4 questions max. Don't ask unnecessary questions — only ask if the ambiguity could lead to wrong work.`;
+
+  return new Promise((resolve) => {
+    const proc = spawn('claude', ['--print', '--model', 'haiku'], {
+      cwd: projectPath,
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-clarify' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    proc.stdin?.write(prompt);
+    proc.stdin?.end();
+
+    let out = '';
+    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    proc.stderr?.on('data', () => {});
+
+    proc.on('close', () => {
+      const trimmed = out.trim();
+      if (trimmed === 'CLEAR' || trimmed.startsWith('CLEAR')) {
+        resolve(null); // No questions needed
+      } else {
+        resolve(trimmed);
+      }
+    });
+    proc.on('error', () => resolve(null));
+    setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 20000);
+  });
+}
+
+// Generate a structured report for an agent's work
+async function generateAgentReport(agent: Agent, task: string, projectPath: string): Promise<AgentReport> {
+  const prompt = `Summarize what this agent did, in 2-3 sentences. Be specific about changes made.
+
+Agent: ${agent.name} (${agent.role})
+Task: ${task}
+Status: ${agent.status}
+Files changed: ${(agent.filesChanged || []).join(', ') || 'none'}
+Output (first 1500 chars): ${(agent.output || '').substring(0, 1500)}
+
+Respond with ONLY valid JSON:
+{"summary":"what was done","reasoning":"why these changes were made"}`;
+
+  return new Promise((resolve) => {
+    const proc = spawn('claude', ['--print', '--model', 'haiku'], {
+      cwd: projectPath,
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-report' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    proc.stdin?.write(prompt);
+    proc.stdin?.end();
+
+    let out = '';
+    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    proc.stderr?.on('data', () => {});
+
+    proc.on('close', () => {
+      try {
+        const match = out.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          resolve({
+            agentName: agent.name,
+            role: agent.role,
+            task,
+            status: agent.status,
+            reasoning: parsed.reasoning || 'No reasoning provided',
+            filesChanged: agent.filesChanged || [],
+            summary: parsed.summary || 'No summary available'
+          });
+          return;
+        }
+      } catch {}
+      resolve({
+        agentName: agent.name,
+        role: agent.role,
+        task,
+        status: agent.status,
+        reasoning: 'Report generation failed',
+        filesChanged: agent.filesChanged || [],
+        summary: agent.output?.substring(0, 200) || 'No output'
+      });
+    });
+    proc.on('error', () => {
+      resolve({
+        agentName: agent.name, role: agent.role, task, status: agent.status,
+        reasoning: 'Error generating report', filesChanged: agent.filesChanged || [],
+        summary: 'Error'
+      });
+    });
+    setTimeout(() => { try { proc.kill(); } catch {} }, 15000);
+  });
+}
+
+// Pending orchestrations waiting for user confirmation
+interface PendingOrchestration {
+  team: Team;
+  instruction: string;
+  instructionObj?: Instruction;
+  stage: 'clarifying' | 'composing';
+  recommendedAgents?: { name: string; plugin: string; reason: string; model: string }[];
+}
+const pendingOrchestrations = new Map<string, PendingOrchestration>();
+
 // Main orchestration: plan → execute phases sequentially
-async function orchestrateTeam(team: Team, instruction: string) {
+async function orchestrateTeam(team: Team, instruction: string, instructionObj?: Instruction) {
   const project = team.projectId ? projectsState.get(team.projectId) : undefined;
   if (!project) {
     addLog(team.id, undefined, 'error', 'Cannot execute: no project assigned or project not found');
     return;
   }
 
-  // Phase 0: Team Composition
+  // Phase -1: Clarifying Questions
+  team.phase = 'analyzing';
+  io.emit('team:updated', team);
+  addLog(team.id, undefined, 'info', 'Orchestrator: analyzing task for ambiguities...');
+
+  const questions = await analyzeForClarification(team, instruction, project.path);
+  if (questions) {
+    addLog(team.id, undefined, 'info', `Orchestrator: needs clarification before proceeding`);
+
+    // Store pending orchestration and emit questions via chat
+    pendingOrchestrations.set(team.id, { team, instruction, instructionObj, stage: 'clarifying' });
+
+    // Add to chat history
+    if (!chatHistories.has(team.id)) chatHistories.set(team.id, []);
+    chatHistories.get(team.id)!.push({
+      role: 'assistant',
+      content: `Before I proceed with the task, I have a few questions:\n\n${questions}\n\nPlease answer in the chat, then say **"proceed"** when you're ready for me to execute.`,
+      timestamp: new Date().toISOString()
+    });
+
+    if (instructionObj) {
+      instructionObj.status = 'clarifying';
+      instructionObj.clarifyingQuestions = questions;
+      io.emit('instruction:updated', instructionObj);
+    }
+
+    team.phase = 'waiting for input';
+    io.emit('team:updated', team);
+    io.emit('chat:questions', { teamId: team.id, questions });
+    return;
+  }
+
+  await executeOrchestration(team, instruction, project, instructionObj);
+}
+
+// Execute after team is already composed (skip composition step)
+async function executeOrchestrationAfterComposition(
+  team: Team, instruction: string, project: Project, instructionObj?: Instruction
+) {
+  addLog(team.id, undefined, 'info', `Orchestrator: team ready — ${team.agents.length} agent(s): ${team.agents.map(a => a.name).join(', ')}`);
+  await executePlanAndPhases(team, instruction, project, instructionObj);
+}
+
+// The actual execution after clarification (or if none needed)
+async function executeOrchestration(
+  team: Team,
+  instruction: string,
+  project: Project,
+  instructionObj?: Instruction
+) {
+  // Phase 0: Team Composition — ask user to confirm agents
   team.phase = 'composing';
   io.emit('team:updated', team);
-  addLog(team.id, undefined, 'info', `Orchestrator: analyzing task and composing team (${availableAgents.length} agents in catalog)...`);
+  addLog(team.id, undefined, 'info', `Orchestrator: analyzing task to recommend agents (${availableAgents.length} in catalog)...`);
 
-  await composeTeam(team, instruction, project.path);
-  addLog(team.id, undefined, 'info', `Orchestrator: team composed — ${team.agents.length} agent(s): ${team.agents.map(a => a.name).join(', ')}`);
+  const recommendations = await getAgentRecommendations(team, instruction, project.path);
+
+  if (recommendations.length > 0) {
+    // Format recommendations for the user
+    const agentList = recommendations.map((r, i) =>
+      `${i + 1}. **${r.name}** (${r.plugin}) — ${r.reason}`
+    ).join('\n');
+
+    const chatMsg = `I've analyzed the task and recommend the following agents:\n\n${agentList}\n\n` +
+      `**Reply with:**\n` +
+      `- **"approve"** to use all recommended agents\n` +
+      `- **"remove 2, 4"** to exclude specific agents by number\n` +
+      `- **"add agent-name"** to include an additional agent from the catalog\n` +
+      `- Or describe what you'd like to change`;
+
+    if (!chatHistories.has(team.id)) chatHistories.set(team.id, []);
+    chatHistories.get(team.id)!.push({ role: 'assistant', content: chatMsg, timestamp: new Date().toISOString() });
+
+    pendingOrchestrations.set(team.id, {
+      team,
+      instruction,
+      instructionObj,
+      stage: 'composing',
+      recommendedAgents: recommendations
+    });
+
+    if (instructionObj) {
+      instructionObj.status = 'clarifying';
+      io.emit('instruction:updated', instructionObj);
+    }
+
+    team.phase = 'waiting for team approval';
+    io.emit('team:updated', team);
+    io.emit('chat:questions', { teamId: team.id, questions: chatMsg });
+    addLog(team.id, undefined, 'info', `Orchestrator: recommended ${recommendations.length} agents, waiting for approval`);
+    return;
+  }
+
+  addLog(team.id, undefined, 'info', `Orchestrator: proceeding with existing team — ${team.agents.length} agent(s)`);
+  await executePlanAndPhases(team, instruction, project, instructionObj);
+}
+
+// Core planning + phased execution logic
+async function executePlanAndPhases(
+  team: Team, instruction: string, project: Project, instructionObj?: Instruction
+) {
+
+  // Create Notion ticket
+  let notionPageId: string | null = null;
+  if (isNotionEnabled()) {
+    const projectName = project.name;
+    notionPageId = await createTaskTicket({
+      title: instruction.substring(0, 100),
+      teamName: team.name,
+      projectName,
+      instruction,
+      agents: team.agents.map(a => a.name)
+    });
+    if (notionPageId && instructionObj) {
+      instructionObj.notionPageId = notionPageId;
+    }
+    if (notionPageId) addLog(team.id, undefined, 'info', 'Notion: ticket created');
+  }
 
   // Phase 1: Planning
   team.phase = 'planning';
@@ -751,11 +997,59 @@ async function orchestrateTeam(team: Team, instruction: string) {
     const phaseOutput = await executePhase(team, phase, project.path, priorContext);
     priorContext += phaseOutput;
 
+    // Generate reports for agents that completed in this phase
+    for (const agent of team.agents.filter(a => phase.agentRoles.includes(a.role) && (a.status === 'complete' || a.status === 'failed'))) {
+      const task = phase.tasks[agent.role] || instruction;
+      const report = await generateAgentReport(agent, task, project.path);
+
+      // Store report in result
+      const result = resultsState.find(r => r.agentId === agent.id && r.teamId === team.id);
+      if (result) result.report = report;
+
+      addLog(team.id, agent.id, 'info', `Report: ${report.summary}`);
+
+      // Push to Notion
+      if (notionPageId) {
+        await appendAgentReport(notionPageId, {
+          agentName: report.agentName,
+          role: report.role,
+          task: report.task,
+          status: report.status,
+          output: agent.output || '',
+          filesChanged: report.filesChanged,
+          reasoning: report.reasoning
+        });
+        await checkAgentTodo(notionPageId, agent.name);
+      }
+
+      // Emit report to frontend
+      io.emit('agent:report', { teamId: team.id, agentId: agent.id, report });
+    }
+
     phases[i].status = 'complete';
     phases[i].endTime = new Date().toISOString();
     io.emit('phase:updated', { teamId: team.id, phase: phases[i], index: i });
     addLog(team.id, undefined, 'info', `Orchestrator: phase "${phase.name}" complete`);
   }
+
+  // Update Notion ticket status
+  if (notionPageId) {
+    const anyFailed = team.agents.some(a => a.status === 'failed');
+    await updateTicketStatus(notionPageId, anyFailed ? 'Failed' : 'Done');
+    addLog(team.id, undefined, 'info', `Notion: ticket updated to ${anyFailed ? 'Failed' : 'Done'}`);
+  }
+
+  // Post summary to chat
+  const completedAgents = team.agents.filter(a => a.status === 'complete');
+  const failedAgents = team.agents.filter(a => a.status === 'failed');
+  const allResults = resultsState.filter(r => r.teamId === team.id && r.report);
+  const chatSummary = `## Task Complete\n\n${completedAgents.length} agent(s) succeeded, ${failedAgents.length} failed.\n\n` +
+    allResults.slice(-team.agents.length).map(r => r.report ? `**${r.report.agentName}**: ${r.report.summary}` : '').filter(Boolean).join('\n\n') +
+    (notionPageId ? '\n\n📋 Notion ticket has been updated with full reports.' : '');
+
+  if (!chatHistories.has(team.id)) chatHistories.set(team.id, []);
+  chatHistories.get(team.id)!.push({ role: 'assistant', content: chatSummary, timestamp: new Date().toISOString() });
+  io.emit('chat:message', { teamId: team.id, message: { role: 'assistant', content: chatSummary } });
 
   addLog(team.id, undefined, 'info', 'Orchestrator: all phases complete');
 }
@@ -853,7 +1147,7 @@ app.post('/api/teams', (req, res) => {
     io.emit('instruction:created', instr);
 
     // Orchestrate agents
-    setTimeout(() => orchestrateTeam(newTeam, instructions.trim()), 500);
+    setTimeout(() => orchestrateTeam(newTeam, instructions.trim(), instr), 500);
   }
 
   res.json(newTeam);
@@ -974,11 +1268,24 @@ app.get('/api/projects', (_req, res) => {
 });
 
 app.post('/api/projects', (req, res) => {
-  const { name, path, description } = req.body;
+  const { name, path, url, description } = req.body;
   const id = `proj-${Date.now()}`;
-  const project: Project = { id, name, path, description, createdAt: new Date().toISOString() };
+  const project: Project = { id, name, path, url, description, createdAt: new Date().toISOString() };
   projectsState.set(id, project);
   io.emit('project:created', project);
+  res.json(project);
+});
+
+app.patch('/api/projects/:projectId', (req, res) => {
+  const project = projectsState.get(req.params.projectId);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const { name, path, url, description } = req.body;
+  if (name !== undefined) project.name = name;
+  if (path !== undefined) project.path = path;
+  if (url !== undefined) project.url = url;
+  if (description !== undefined) project.description = description;
+  projectsState.set(project.id, project);
+  io.emit('project:updated', project);
   res.json(project);
 });
 
@@ -1039,7 +1346,7 @@ app.post('/api/teams/:teamId/instructions', (req, res) => {
     dispatchTeamSimple(team, content);
   } else {
     // Orchestrated execution (default)
-    orchestrateTeam(team, content);
+    orchestrateTeam(team, content, instruction);
   }
 
   res.json(instruction);
@@ -1100,6 +1407,30 @@ app.get('/api/teams/:teamId/agents/:agentId/output', (req, res) => {
   });
 });
 
+// Notion config endpoint
+app.get('/api/notion/status', (_req, res) => {
+  res.json({ enabled: isNotionEnabled() });
+});
+
+app.post('/api/notion/configure', (req, res) => {
+  const { token, databaseId } = req.body;
+  if (!token || !databaseId) return res.status(400).json({ error: 'token and databaseId required' });
+  initNotion(token, databaseId);
+  // Save to .env for persistence
+  const envPath = join(process.cwd(), '.env');
+  const envContent = `NOTION_TOKEN=${token}\nNOTION_DATABASE_ID=${databaseId}\n`;
+  writeFile(envPath, envContent).catch(() => {});
+  res.json({ enabled: true });
+});
+
+// Agent reports endpoint
+app.get('/api/teams/:teamId/reports', (req, res) => {
+  const results = resultsState
+    .filter(r => r.teamId === req.params.teamId && r.report)
+    .map(r => r.report);
+  res.json({ reports: results });
+});
+
 // ============================================================
 // ORCHESTRATOR CHAT
 // ============================================================
@@ -1124,6 +1455,114 @@ app.post('/api/teams/:teamId/chat', (req, res) => {
   if (!chatHistories.has(teamId)) chatHistories.set(teamId, []);
   const history = chatHistories.get(teamId)!;
   history.push({ role: 'user', content: message, timestamp: new Date().toISOString() });
+
+  // Handle pending orchestration interactions
+  const lowerMsg = message.toLowerCase().trim();
+  if (pendingOrchestrations.has(teamId)) {
+    const pending = pendingOrchestrations.get(teamId)!;
+
+    const sendSSE = (msg: string) => {
+      history.push({ role: 'assistant', content: msg, timestamp: new Date().toISOString() });
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.write(`data: ${JSON.stringify({ chunk: msg })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    };
+
+    // Stage: composing — user is approving/modifying agent selection
+    if (pending.stage === 'composing' && pending.recommendedAgents) {
+      const recs = pending.recommendedAgents;
+
+      if (lowerMsg.includes('approve') || lowerMsg === 'ok' || lowerMsg === 'yes' || lowerMsg.includes('go ahead') || lowerMsg.includes('looks good')) {
+        // Approve all recommended agents
+        pendingOrchestrations.delete(teamId);
+        applyAgentSelections(pending.team, recs);
+        addLog(teamId, undefined, 'info', `Team approved: ${recs.map(r => r.name).join(', ')}`);
+
+        const confirmMsg = `Team confirmed with ${recs.length} agents: ${recs.map(r => r.name).join(', ')}.\n\nStarting execution now...`;
+        sendSSE(confirmMsg);
+
+        if (pending.instructionObj) {
+          pending.instructionObj.status = 'executing';
+          io.emit('instruction:updated', pending.instructionObj);
+        }
+
+        const proj = projectsState.get(pending.team.projectId || '');
+        if (proj) {
+          // Skip composition in executeOrchestration since we just did it
+          executeOrchestrationAfterComposition(pending.team, pending.instruction, proj, pending.instructionObj);
+        }
+        return;
+      }
+
+      // Handle "remove 2, 4" style commands
+      const removeMatch = message.match(/remove\s+([\d,\s]+)/i);
+      if (removeMatch) {
+        const indices = removeMatch[1].split(/[,\s]+/).map((n: string) => parseInt(n.trim()) - 1).filter((n: number) => !isNaN(n));
+        const filtered = recs.filter((_, i) => !indices.includes(i));
+        pending.recommendedAgents = filtered;
+        const newList = filtered.map((r, i) => `${i + 1}. **${r.name}** (${r.plugin}) — ${r.reason}`).join('\n');
+        sendSSE(`Updated team:\n\n${newList}\n\nSay **"approve"** to proceed or make more changes.`);
+        return;
+      }
+
+      // Handle "add agent-name" commands
+      const addMatch = message.match(/add\s+([a-z0-9-]+)/i);
+      if (addMatch) {
+        const agentName = addMatch[1];
+        const entry = availableAgents.find(a => a.name === agentName);
+        if (entry) {
+          recs.push({
+            name: entry.name,
+            plugin: entry.plugin,
+            reason: 'Added by user',
+            model: entry.model === 'opus' ? 'claude-opus-4-6' : entry.model === 'haiku' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6'
+          });
+          const newList = recs.map((r, i) => `${i + 1}. **${r.name}** (${r.plugin}) — ${r.reason}`).join('\n');
+          sendSSE(`Added **${entry.name}**. Updated team:\n\n${newList}\n\nSay **"approve"** to proceed.`);
+        } else {
+          // Search for partial matches
+          const matches = availableAgents.filter(a => a.name.includes(agentName)).slice(0, 5);
+          if (matches.length > 0) {
+            sendSSE(`Agent "${agentName}" not found. Did you mean:\n${matches.map(m => `- **${m.name}** (${m.plugin})`).join('\n')}`);
+          } else {
+            sendSSE(`Agent "${agentName}" not found in the catalog. Check the agent list in the Create Team modal.`);
+          }
+        }
+        return;
+      }
+
+      // Any other response — treat as a modification request, use Claude to interpret
+      sendSSE(`I understand. You can:\n- **"approve"** to proceed with current selection\n- **"remove 1, 3"** to drop agents by number\n- **"add agent-name"** to add a specific agent\n\nOr just tell me what you'd like changed.`);
+      return;
+    }
+
+    // Stage: clarifying — user is answering questions
+    if (pending.stage === 'clarifying') {
+      if (lowerMsg.includes('proceed') || lowerMsg.includes('go ahead') || lowerMsg.includes('start') || lowerMsg.includes('execute')) {
+        pendingOrchestrations.delete(teamId);
+
+        const extraContext = history.filter(m => m.role === 'user').slice(-3).map(m => m.content).join('\n');
+        const enrichedInstruction = `${pending.instruction}\n\nAdditional context from user:\n${extraContext}`;
+
+        sendSSE('Got it! Analyzing the task and recommending agents now...');
+
+        if (pending.instructionObj) {
+          pending.instructionObj.status = 'executing';
+          io.emit('instruction:updated', pending.instructionObj);
+        }
+
+        const proj = projectsState.get(pending.team.projectId || '');
+        if (proj) {
+          executeOrchestration(pending.team, enrichedInstruction, proj, pending.instructionObj);
+        }
+        return;
+      }
+
+      // User is still answering — just continue the conversation normally (fall through to Claude chat)
+    }
+  }
 
   // Build context for the orchestrator
   const teamInfo = team.agents.map(a => `- ${a.name} (${a.role}): ${a.status}, progress ${a.progress}%${a.currentTask ? `, task: ${a.currentTask}` : ''}`).join('\n');

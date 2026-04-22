@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
+import { io } from 'socket.io-client';
 
 const API = 'http://localhost:3001';
+const socket = io(API);
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -13,6 +15,7 @@ export default function OrchestratorChat({ teamId, teamName }: { teamId: string;
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
+  const [hasUnread, setHasUnread] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -21,6 +24,33 @@ export default function OrchestratorChat({ teamId, teamName }: { teamId: string;
       .then(data => setMessages(data.messages || []))
       .catch(() => {});
   }, [teamId]);
+
+  // Listen for orchestrator-pushed messages (clarifying questions, reports)
+  useEffect(() => {
+    const handleQuestions = ({ teamId: tid }: { teamId: string; questions: string }) => {
+      if (tid === teamId) {
+        // Refetch chat to get the question message
+        fetch(`${API}/api/teams/${teamId}/chat`)
+          .then(r => r.json())
+          .then(data => setMessages(data.messages || []))
+          .catch(() => {});
+        setIsOpen(true); // Auto-open chat when questions arrive
+        setHasUnread(true);
+      }
+    };
+    const handleMessage = ({ teamId: tid, message }: { teamId: string; message: ChatMessage }) => {
+      if (tid === teamId) {
+        setMessages(prev => [...prev, message]);
+        if (!isOpen) setHasUnread(true);
+      }
+    };
+    socket.on('chat:questions', handleQuestions);
+    socket.on('chat:message', handleMessage);
+    return () => {
+      socket.off('chat:questions', handleQuestions);
+      socket.off('chat:message', handleMessage);
+    };
+  }, [teamId, isOpen]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -95,13 +125,15 @@ export default function OrchestratorChat({ teamId, teamName }: { teamId: string;
   if (!isOpen) {
     return (
       <button
-        onClick={() => setIsOpen(true)}
-        className="fixed bottom-6 right-6 bg-indigo-600 hover:bg-indigo-700 rounded-full px-5 py-3 shadow-xl flex items-center gap-2 transition-colors z-40"
+        onClick={() => { setIsOpen(true); setHasUnread(false); }}
+        className={`fixed bottom-6 right-6 ${hasUnread ? 'bg-orange-500 hover:bg-orange-600 animate-pulse' : 'bg-indigo-600 hover:bg-indigo-700'} rounded-full px-5 py-3 shadow-xl flex items-center gap-2 transition-colors z-40`}
       >
         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
         </svg>
-        <span className="text-sm font-medium">Chat with Orchestrator</span>
+        <span className="text-sm font-medium">
+          {hasUnread ? 'Orchestrator needs input!' : 'Chat with Orchestrator'}
+        </span>
         {messages.length > 0 && (
           <span className="bg-indigo-400/30 text-[10px] px-1.5 py-0.5 rounded-full">{messages.length}</span>
         )}

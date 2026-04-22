@@ -1,8 +1,20 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { io } from 'socket.io-client';
 import { Team } from '../types';
 import AddAgentModal from './AddAgentModal';
 
 const API = 'http://localhost:3001';
+const socket = io(API);
+
+interface AgentReport {
+  agentName: string;
+  role: string;
+  task: string;
+  status: string;
+  reasoning: string;
+  filesChanged: string[];
+  summary: string;
+}
 
 const statusColors: Record<string, string> = {
   idle: 'bg-gray-500',
@@ -67,6 +79,34 @@ function AgentInstructInput({ teamId, agentId, agentName }: { teamId: string; ag
 export default function TeamMonitor({ team }: { team: Team }) {
   const [showAddAgent, setShowAddAgent] = useState(false);
   const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
+  const [reports, setReports] = useState<Record<string, AgentReport>>({});
+
+  // Fetch reports
+  useEffect(() => {
+    fetch(`${API}/api/teams/${team.id}/reports`)
+      .then(r => r.json())
+      .then(data => {
+        const map: Record<string, AgentReport> = {};
+        for (const r of data.reports || []) {
+          // Key by role since agentId may change
+          const agent = team.agents.find(a => a.role === r.role);
+          if (agent) map[agent.id] = r;
+        }
+        setReports(map);
+      })
+      .catch(() => {});
+  }, [team.id, team.agents]);
+
+  // Listen for live reports
+  useEffect(() => {
+    const handler = ({ teamId, agentId, report }: { teamId: string; agentId: string; report: AgentReport }) => {
+      if (teamId === team.id) {
+        setReports(prev => ({ ...prev, [agentId]: report }));
+      }
+    };
+    socket.on('agent:report', handler);
+    return () => { socket.off('agent:report', handler); };
+  }, [team.id]);
 
   const avgProgress = team.agents.length > 0
     ? Math.round(team.agents.reduce((s, a) => s + a.progress, 0) / team.agents.length)
@@ -166,6 +206,23 @@ export default function TeamMonitor({ team }: { team: Team }) {
                 {/* Per-agent instruction input */}
                 <AgentInstructInput teamId={team.id} agentId={agent.id} agentName={agent.name} />
 
+                {/* Report */}
+                {reports[agent.id] && (
+                  <div className="mt-3 bg-gray-800 rounded-lg p-3 border border-gray-700">
+                    <div className="text-xs font-semibold text-gray-400 mb-2">Agent Report</div>
+                    <div className="space-y-2">
+                      <div>
+                        <span className="text-[10px] text-gray-500">Summary</span>
+                        <p className="text-sm text-gray-200">{reports[agent.id].summary}</p>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-gray-500">Reasoning</span>
+                        <p className="text-sm text-gray-300">{reports[agent.id].reasoning}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {agent.filesChanged && agent.filesChanged.length > 0 && (
                   <div className="mt-3">
                     <div className="text-xs font-semibold text-gray-400 mb-1">Files Changed</div>
@@ -178,13 +235,16 @@ export default function TeamMonitor({ team }: { team: Team }) {
                 )}
                 {agent.output && (
                   <div className="mt-3">
-                    <div className="text-xs font-semibold text-gray-400 mb-1">Output</div>
-                    <pre className="text-xs text-gray-300 bg-gray-950 rounded p-3 max-h-64 overflow-auto whitespace-pre-wrap font-mono leading-relaxed">
-                      {agent.output}
-                    </pre>
+                    <div className="text-xs font-semibold text-gray-400 mb-1">Full Output</div>
+                    <details className="text-xs">
+                      <summary className="text-gray-400 cursor-pointer hover:text-gray-200 mb-1">Click to expand</summary>
+                      <pre className="text-gray-300 bg-gray-950 rounded p-3 max-h-64 overflow-auto whitespace-pre-wrap font-mono leading-relaxed">
+                        {agent.output}
+                      </pre>
+                    </details>
                   </div>
                 )}
-                {!agent.output && !agent.filesChanged?.length && agent.status === 'idle' && (
+                {!agent.output && !agent.filesChanged?.length && !reports[agent.id] && agent.status === 'idle' && (
                   <p className="mt-3 text-xs text-gray-500">No output yet. Send an instruction to this agent above.</p>
                 )}
               </div>
