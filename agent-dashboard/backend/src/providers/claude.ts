@@ -12,6 +12,7 @@ export class ClaudeCliProvider implements OrchestratorProvider {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let full = '';
+      let stderr = '';
       const onAbort = () => { try { proc.kill(); } catch {} };
       signal.addEventListener('abort', onAbort);
 
@@ -24,13 +25,25 @@ export class ClaudeCliProvider implements OrchestratorProvider {
         onChunk(s);
       });
 
+      proc.stderr.on('data', (d: Buffer) => {
+        stderr += d.toString();
+      });
+
       proc.on('error', (err) => {
         signal.removeEventListener('abort', onAbort);
         reject(err);
       });
 
-      proc.on('close', () => {
+      proc.on('close', (code) => {
         signal.removeEventListener('abort', onAbort);
+        if (full.trim().length === 0) {
+          // Surface whatever Claude CLI wrote so failures aren't invisible.
+          const detail = stderr.trim() || `claude exited with code ${code} and no output`;
+          console.error('[ClaudeCliProvider] empty stdout. cwd=%s model=%s exit=%d stderr=%s',
+            this.opts.cwd, `(model passed in)`, code, detail.slice(0, 500));
+          reject(new Error(`claude CLI produced no output: ${detail}`));
+          return;
+        }
         resolve({ fullText: full });
       });
     });
