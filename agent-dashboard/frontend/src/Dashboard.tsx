@@ -100,7 +100,6 @@ export default function Dashboard() {
             projects={projects}
             selectedProjectId={selectedProjectId}
             onSelect={(id) => setSelectedProjectId(id)}
-            onAddProject={(project) => setProjects(prev => [...prev, project])}
           />
         </div>
 

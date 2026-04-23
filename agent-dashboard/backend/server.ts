@@ -1129,8 +1129,16 @@ app.patch('/api/projects/:projectId', (req, res) => {
 });
 
 app.delete('/api/projects/:projectId', (req, res) => {
-  projectsState.delete(req.params.projectId);
-  io.emit('project:deleted', { projectId: req.params.projectId });
+  const projectId = req.params.projectId;
+  projectsState.delete(projectId);
+  // Unlink any teams that referenced this project so they don't orphan.
+  for (const team of teamsState.values()) {
+    if (team.projectId === projectId) {
+      team.projectId = undefined;
+      io.emit('team:updated', team);
+    }
+  }
+  io.emit('project:deleted', { projectId });
   res.json({ ok: true });
 });
 

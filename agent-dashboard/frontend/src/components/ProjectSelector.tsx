@@ -7,10 +7,9 @@ interface Props {
   projects: Project[];
   selectedProjectId: string | null;
   onSelect: (projectId: string | null) => void;
-  onAddProject: (project: Project) => void;
 }
 
-export default function ProjectSelector({ projects, selectedProjectId, onSelect, onAddProject }: Props) {
+export default function ProjectSelector({ projects, selectedProjectId, onSelect }: Props) {
   const [showAdd, setShowAdd] = useState(false);
   const [showManage, setShowManage] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -40,7 +39,8 @@ export default function ProjectSelector({ projects, selectedProjectId, onSelect,
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
       const project = await res.json();
-      onAddProject(project);
+      // The backend emits project:created via socket; Dashboard listens
+      // and appends. Don't double-push via onAddProject.
       onSelect(project.id);
       setNewName('');
       setNewPath('');
