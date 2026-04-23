@@ -5,6 +5,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { readdir, readFile, writeFile, stat, mkdir } from 'fs/promises';
 import { join, basename, dirname } from 'path';
 import { existsSync } from 'fs';
+import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { initNotion, isNotionEnabled, createTaskTicket, updateTicketStatus, appendAgentReport, checkAgentTodo } from './notion.js';
@@ -132,12 +133,6 @@ interface LogEntry {
   agentId?: string;
   level: 'info' | 'warn' | 'error';
   message: string;
-}
-
-interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: string;
 }
 
 const availableAgents: AvailableAgent[] = [];
@@ -858,13 +853,17 @@ async function orchestrateTeam(team: Team, instruction: string, instructionObj?:
     // Store pending orchestration and emit questions via chat
     pendingOrchestrations.set(team.id, { team, instruction, instructionObj, stage: 'clarifying' });
 
-    // Add to chat history
-    if (!chatHistories.has(team.id)) chatHistories.set(team.id, []);
-    chatHistories.get(team.id)!.push({
-      role: 'assistant',
-      content: `Before I proceed with the task, I have a few questions:\n\n${questions}\n\nPlease answer in the chat, then say **"proceed"** when you're ready for me to execute.`,
-      timestamp: new Date().toISOString()
-    });
+    {
+      const msg = {
+        id: randomUUID(),
+        role: 'assistant' as const,
+        kind: 'text' as const,
+        content: `Before I proceed with the task, I have a few questions:\n\n${questions}\n\nPlease answer in the chat, then say **"proceed"** when you're ready for me to execute.`,
+        createdAt: new Date().toISOString(),
+      };
+      messageStore.append(team.id, msg);
+      io.emit('chat:message', { teamId: team.id, message: msg });
+    }
 
     if (instructionObj) {
       instructionObj.status = 'clarifying';
@@ -916,8 +915,17 @@ async function executeOrchestration(
       `- **"add agent-name"** to include an additional agent from the catalog\n` +
       `- Or describe what you'd like to change`;
 
-    if (!chatHistories.has(team.id)) chatHistories.set(team.id, []);
-    chatHistories.get(team.id)!.push({ role: 'assistant', content: chatMsg, timestamp: new Date().toISOString() });
+    {
+      const msg = {
+        id: randomUUID(),
+        role: 'assistant' as const,
+        kind: 'text' as const,
+        content: chatMsg,
+        createdAt: new Date().toISOString(),
+      };
+      messageStore.append(team.id, msg);
+      io.emit('chat:message', { teamId: team.id, message: msg });
+    }
 
     pendingOrchestrations.set(team.id, {
       team,
@@ -1094,9 +1102,17 @@ async function executePlanAndPhases(
     allResults.slice(-team.agents.length).map(r => r.report ? `**${r.report.agentName}**: ${r.report.summary}` : '').filter(Boolean).join('\n\n') +
     (notionPageId ? '\n\n📋 Notion ticket has been updated with full reports.' : '');
 
-  if (!chatHistories.has(team.id)) chatHistories.set(team.id, []);
-  chatHistories.get(team.id)!.push({ role: 'assistant', content: chatSummary, timestamp: new Date().toISOString() });
-  io.emit('chat:message', { teamId: team.id, message: { role: 'assistant', content: chatSummary } });
+  {
+    const msg = {
+      id: randomUUID(),
+      role: 'assistant' as const,
+      kind: 'text' as const,
+      content: chatSummary,
+      createdAt: new Date().toISOString(),
+    };
+    messageStore.append(team.id, msg);
+    io.emit('chat:message', { teamId: team.id, message: msg });
+  }
 
   addLog(team.id, undefined, 'info', 'Orchestrator: all phases complete');
 }
@@ -1403,50 +1419,6 @@ app.patch('/api/teams/:teamId', (req, res) => {
 // INSTRUCTIONS
 // ============================================================
 
-app.get('/api/teams/:teamId/instructions', (req, res) => {
-  const instructions = instructionsState.filter(i => i.teamId === req.params.teamId);
-  res.json({ instructions });
-});
-
-app.post('/api/teams/:teamId/instructions', (req, res) => {
-  const { content, mode, agentId } = req.body;
-  // mode: 'orchestrate' (default) | 'parallel' | 'agent'
-  const teamId = req.params.teamId;
-  const team = teamsState.get(teamId);
-  if (!team) return res.status(404).json({ error: 'Team not found' });
-
-  const instruction: Instruction = {
-    id: `instr-${Date.now()}`,
-    teamId,
-    projectId: team.projectId,
-    content,
-    status: 'executing',
-    createdAt: new Date().toISOString(),
-    acknowledgedAt: new Date().toISOString()
-  };
-  instructionsState.push(instruction);
-
-  addLog(teamId, undefined, 'info', `Instruction received (${mode || 'orchestrate'}): "${content.length > 80 ? content.substring(0, 80) + '...' : content}"`);
-  io.emit('instruction:created', instruction);
-
-  if (agentId) {
-    // Per-agent instruction
-    const agent = team.agents.find(a => a.id === agentId);
-    if (agent) {
-      addLog(teamId, agentId, 'info', `Direct instruction to ${agent.name}: ${content.substring(0, 80)}`);
-      dispatchSingleAgent(team, agent, content);
-    }
-  } else if (mode === 'parallel') {
-    // Simple parallel dispatch
-    dispatchTeamSimple(team, content);
-  } else {
-    // Orchestrated execution (default)
-    orchestrateTeam(team, content, instruction);
-  }
-
-  res.json(instruction);
-});
-
 // Per-agent instruction endpoint
 app.post('/api/teams/:teamId/agents/:agentId/instruct', (req, res) => {
   const { content } = req.body;
@@ -1526,230 +1498,6 @@ app.get('/api/teams/:teamId/reports', (req, res) => {
   res.json({ reports: results });
 });
 
-// ============================================================
-// ORCHESTRATOR CHAT
-// ============================================================
-
-const chatHistories = new Map<string, ChatMessage[]>();
-
-app.get('/api/teams/:teamId/chat', (req, res) => {
-  const history = chatHistories.get(req.params.teamId) || [];
-  res.json({ messages: history });
-});
-
-app.post('/api/teams/:teamId/chat', (req, res) => {
-  const { message } = req.body;
-  const teamId = req.params.teamId;
-  const team = teamsState.get(teamId);
-  if (!team) return res.status(404).json({ error: 'Team not found' });
-
-  const project = team.projectId ? projectsState.get(team.projectId) : undefined;
-  if (!project) return res.status(400).json({ error: 'No project assigned' });
-
-  // Store user message
-  if (!chatHistories.has(teamId)) chatHistories.set(teamId, []);
-  const history = chatHistories.get(teamId)!;
-  history.push({ role: 'user', content: message, timestamp: new Date().toISOString() });
-
-  // Handle pending orchestration interactions
-  const lowerMsg = message.toLowerCase().trim();
-  if (pendingOrchestrations.has(teamId)) {
-    const pending = pendingOrchestrations.get(teamId)!;
-
-    const sendSSE = (msg: string) => {
-      history.push({ role: 'assistant', content: msg, timestamp: new Date().toISOString() });
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.write(`data: ${JSON.stringify({ chunk: msg })}\n\n`);
-      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-      res.end();
-    };
-
-    // Stage: composing — user is approving/modifying agent selection
-    if (pending.stage === 'composing' && pending.recommendedAgents) {
-      const recs = pending.recommendedAgents;
-
-      if (lowerMsg.includes('approve') || lowerMsg === 'ok' || lowerMsg === 'yes' || lowerMsg.includes('go ahead') || lowerMsg.includes('looks good')) {
-        // Approve all recommended agents
-        pendingOrchestrations.delete(teamId);
-        applyAgentSelections(pending.team, recs);
-        addLog(teamId, undefined, 'info', `Team approved: ${recs.map(r => r.name).join(', ')}`);
-
-        const confirmMsg = `Team confirmed with ${recs.length} agents: ${recs.map(r => r.name).join(', ')}.\n\nStarting execution now...`;
-        sendSSE(confirmMsg);
-
-        if (pending.instructionObj) {
-          pending.instructionObj.status = 'executing';
-          io.emit('instruction:updated', pending.instructionObj);
-        }
-
-        const proj = projectsState.get(pending.team.projectId || '');
-        if (proj) {
-          // Skip composition in executeOrchestration since we just did it
-          executeOrchestrationAfterComposition(pending.team, pending.instruction, proj, pending.instructionObj);
-        }
-        return;
-      }
-
-      // Handle "remove 2, 4" style commands
-      const removeMatch = message.match(/remove\s+([\d,\s]+)/i);
-      if (removeMatch) {
-        const indices = removeMatch[1].split(/[,\s]+/).map((n: string) => parseInt(n.trim()) - 1).filter((n: number) => !isNaN(n));
-        const filtered = recs.filter((_, i) => !indices.includes(i));
-        pending.recommendedAgents = filtered;
-        const newList = filtered.map((r, i) => `${i + 1}. **${r.name}** (${r.plugin}) — ${r.reason}`).join('\n');
-        sendSSE(`Updated team:\n\n${newList}\n\nSay **"approve"** to proceed or make more changes.`);
-        return;
-      }
-
-      // Handle "add agent-name" commands
-      const addMatch = message.match(/add\s+([a-z0-9-]+)/i);
-      if (addMatch) {
-        const agentName = addMatch[1];
-        const entry = availableAgents.find(a => a.name === agentName);
-        if (entry) {
-          recs.push({
-            name: entry.name,
-            plugin: entry.plugin,
-            reason: 'Added by user',
-            model: entry.model === 'opus' ? 'claude-opus-4-6' : entry.model === 'haiku' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6'
-          });
-          const newList = recs.map((r, i) => `${i + 1}. **${r.name}** (${r.plugin}) — ${r.reason}`).join('\n');
-          sendSSE(`Added **${entry.name}**. Updated team:\n\n${newList}\n\nSay **"approve"** to proceed.`);
-        } else {
-          // Search for partial matches
-          const matches = availableAgents.filter(a => a.name.includes(agentName)).slice(0, 5);
-          if (matches.length > 0) {
-            sendSSE(`Agent "${agentName}" not found. Did you mean:\n${matches.map(m => `- **${m.name}** (${m.plugin})`).join('\n')}`);
-          } else {
-            sendSSE(`Agent "${agentName}" not found in the catalog. Check the agent list in the Create Team modal.`);
-          }
-        }
-        return;
-      }
-
-      // Any other response — treat as a modification request, use Claude to interpret
-      sendSSE(`I understand. You can:\n- **"approve"** to proceed with current selection\n- **"remove 1, 3"** to drop agents by number\n- **"add agent-name"** to add a specific agent\n\nOr just tell me what you'd like changed.`);
-      return;
-    }
-
-    // Stage: clarifying — user is answering questions
-    if (pending.stage === 'clarifying') {
-      if (lowerMsg.includes('proceed') || lowerMsg.includes('go ahead') || lowerMsg.includes('start') || lowerMsg.includes('execute')) {
-        pendingOrchestrations.delete(teamId);
-
-        const extraContext = history.filter(m => m.role === 'user').slice(-3).map(m => m.content).join('\n');
-        const enrichedInstruction = `${pending.instruction}\n\nAdditional context from user:\n${extraContext}`;
-
-        sendSSE('Got it! Analyzing the task and recommending agents now...');
-
-        if (pending.instructionObj) {
-          pending.instructionObj.status = 'executing';
-          io.emit('instruction:updated', pending.instructionObj);
-        }
-
-        const proj = projectsState.get(pending.team.projectId || '');
-        if (proj) {
-          executeOrchestration(pending.team, enrichedInstruction, proj, pending.instructionObj);
-        }
-        return;
-      }
-
-      // User is still answering — just continue the conversation normally (fall through to Claude chat)
-    }
-  }
-
-  // Build context for the orchestrator
-  const teamInfo = team.agents.map(a => `- ${a.name} (${a.role}): ${a.status}, progress ${a.progress}%${a.currentTask ? `, task: ${a.currentTask}` : ''}`).join('\n');
-  const recentResults = resultsState
-    .filter(r => r.teamId === teamId)
-    .slice(-3)
-    .map(r => `Agent ${r.agentId}: ${r.filesChanged.length} files changed, exit ${r.exitCode}`)
-    .join('\n');
-
-  const conversationContext = history.slice(-10).map(m => `${m.role === 'user' ? 'User' : 'Orchestrator'}: ${m.content}`).join('\n\n');
-
-  const prompt = `You are an orchestrator assistant for a development team. You help the user plan, manage, and direct their agent team.
-
-Project: ${project.name} (${project.path})
-
-Current team:
-${teamInfo || '(no agents)'}
-
-Recent results:
-${recentResults || '(none yet)'}
-
-Available actions you can suggest:
-- Recommend adding/removing agents
-- Suggest what instructions to give
-- Analyze what the team has done so far
-- Answer questions about the project
-- Help plan next steps
-
-IMPORTANT: If the user asks you to actually execute something (make changes, run agents, etc.), tell them what instruction to send via the Instructions panel, or what agent to direct. You are advisory — you plan and suggest, agents execute.
-
-If the user asks you to "wait for instructions" or similar, acknowledge and explain what you've analyzed so far.
-
-Conversation:
-${conversationContext}
-
-Respond concisely and helpfully.`;
-
-  // Stream response via SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  console.log(`[chat] Spawning claude in ${project.path}, prompt length: ${prompt.length}`);
-
-  const proc = spawn('claude', ['--print', '--model', 'sonnet'], {
-    cwd: project.path,
-    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-chat' },
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-  proc.stdin?.write(prompt);
-  proc.stdin?.end();
-
-  let fullResponse = '';
-  let stderrOutput = '';
-
-  proc.stdout?.on('data', (data: Buffer) => {
-    const chunk = data.toString();
-    fullResponse += chunk;
-    try {
-      res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
-    } catch { /* client may have disconnected */ }
-  });
-
-  proc.stderr?.on('data', (data: Buffer) => {
-    stderrOutput += data.toString();
-  });
-
-  proc.on('close', (code) => {
-    console.log(`[chat] claude exited with code ${code}, stdout: ${fullResponse.length} bytes, stderr: ${stderrOutput.length} bytes`);
-    if (stderrOutput) console.log(`[chat] stderr: ${stderrOutput.substring(0, 500)}`);
-    // Store assistant response
-    if (fullResponse.trim()) {
-      history.push({ role: 'assistant', content: fullResponse, timestamp: new Date().toISOString() });
-      scheduleSave();
-    }
-    try {
-      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-      res.end();
-    } catch { /* already closed */ }
-  });
-
-  proc.on('error', (err) => {
-    try {
-      res.write(`data: ${JSON.stringify({ chunk: `Error: ${err.message}`, done: true })}\n\n`);
-      res.end();
-    } catch { /* already closed */ }
-  });
-
-  // Timeout after 120s
-  const timeout = setTimeout(() => { try { proc.kill(); } catch {} }, 120000);
-  proc.on('close', () => clearTimeout(timeout));
-});
 
 // ============================================================
 // METRICS & LOGS
