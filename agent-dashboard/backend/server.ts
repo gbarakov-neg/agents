@@ -240,7 +240,8 @@ io.emit = ((event: string, ...args: unknown[]) => {
     event.startsWith('team:') ||
     event.startsWith('project:') ||
     event.startsWith('instruction:') ||
-    event === 'agent:updated'
+    event === 'agent:updated' ||
+    event === 'chat:message'
   )) {
     scheduleSave();
   }
@@ -487,112 +488,6 @@ interface OrchestratorPlan {
   }[];
 }
 
-// Get agent recommendations from Claude (does NOT apply them)
-async function getAgentRecommendations(
-  team: Team, instruction: string, projectPath: string
-): Promise<{ name: string; plugin: string; reason: string; model: string }[]> {
-  const catalog = availableAgents
-    .map(a => `${a.name} (${a.plugin}): ${a.description.substring(0, 80)}`)
-    .join('\n');
-
-  const currentRoles = team.agents.map(a => a.role);
-  const currentList = currentRoles.length > 0
-    ? `Current team members already assigned: ${currentRoles.join(', ')}`
-    : 'Current team: empty — recommend all needed agents';
-
-  const prompt = `You are a team composition expert. Given a task and a catalog of available agents, recommend which agents are needed.
-
-Task: ${instruction}
-
-${currentList}
-
-Available agents catalog:
-${catalog}
-
-Respond with ONLY valid JSON (no markdown, no backticks):
-{"agents":[{"name":"agent-name-from-catalog","plugin":"plugin-name","reason":"one sentence why this agent is needed"}]}
-
-Rules:
-- Only recommend agents that are essential for THIS specific task
-- 3-6 agents is ideal, don't over-staff
-- Use exact agent names from the catalog
-- Include agents already on the team if they should stay
-- Don't include agents that aren't relevant`;
-
-  return new Promise((resolve) => {
-    const proc = spawn('claude', ['--print', '--model', 'haiku'], {
-      cwd: projectPath,
-      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-composer' },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    proc.stdin?.write(prompt);
-    proc.stdin?.end();
-
-    let out = '';
-    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    proc.stderr?.on('data', () => {});
-
-    proc.on('close', () => {
-      try {
-        const match = out.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          if (parsed.agents && Array.isArray(parsed.agents)) {
-            resolve(parsed.agents.map((a: any) => {
-              const entry = availableAgents.find(av => av.name === a.name);
-              return {
-                name: a.name,
-                plugin: a.plugin || entry?.plugin || 'unknown',
-                reason: a.reason || '',
-                model: entry?.model === 'opus' ? 'claude-opus-4-6'
-                  : entry?.model === 'haiku' ? 'claude-haiku-4-5-20251001'
-                  : 'claude-sonnet-4-6'
-              };
-            }).filter((a: any) => availableAgents.some(av => av.name === a.name)));
-            return;
-          }
-        }
-      } catch {}
-      resolve([]);
-    });
-    proc.on('error', () => resolve([]));
-    setTimeout(() => { try { proc.kill(); } catch {} resolve([]); }, 30000);
-  });
-}
-
-// Apply confirmed agent selections to the team
-function applyAgentSelections(
-  team: Team,
-  selectedAgents: { name: string; plugin: string; model: string }[]
-) {
-  // Remove agents not in the selection (only idle ones)
-  const selectedRoles = new Set(selectedAgents.map(a => a.name));
-  team.agents = team.agents.filter(a => a.status !== 'idle' || selectedRoles.has(a.role));
-
-  // Add new agents
-  for (const sel of selectedAgents) {
-    if (team.agents.some(a => a.role === sel.name)) continue;
-
-    const catalogEntry = availableAgents.find(a => a.name === sel.name);
-    if (!catalogEntry) continue;
-
-    const displayName = sel.name.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-    const newAgent: Agent = {
-      id: `agent-${Math.random().toString(36).substring(2, 11)}`,
-      name: displayName,
-      role: sel.name,
-      status: 'idle',
-      progress: 0,
-      model: sel.model || 'claude-sonnet-4-6',
-      plugin: catalogEntry.plugin
-    };
-    team.agents.push(newAgent);
-    addLog(team.id, newAgent.id, 'info', `Added ${displayName} (${catalogEntry.plugin})`);
-  }
-
-  io.emit('team:updated', team);
-}
-
 // Run Claude to create an execution plan
 async function createPlan(team: Team, instruction: string, projectPath: string): Promise<OrchestratorPlan> {
   const agentList = team.agents.map(a => `- ${a.name} (role: ${a.role})`).join('\n');
@@ -712,53 +607,6 @@ function executePhase(
   });
 }
 
-// Analyze task and ask clarifying questions if needed
-async function analyzeForClarification(team: Team, instruction: string, projectPath: string): Promise<string | null> {
-  const agentList = team.agents.map(a => `- ${a.name} (${a.role})`).join('\n');
-
-  const prompt = `You are a project orchestrator. A user wants their agent team to execute a task. Before proceeding, analyze the instruction for ambiguity.
-
-Task: ${instruction}
-
-Team:
-${agentList || '(will be auto-composed)'}
-
-Review the task and determine if you need clarification. Consider:
-- Is the scope clear? (which files, which features, what boundaries?)
-- Are there technical decisions that need input? (framework choice, API design, etc.)
-- Could this be interpreted multiple ways?
-- Is there anything that could go wrong without more context?
-
-If the task is clear enough to proceed, respond with ONLY: CLEAR
-
-If you need clarification, respond with your questions in a friendly, concise format. Number each question. Keep it to 2-4 questions max. Don't ask unnecessary questions — only ask if the ambiguity could lead to wrong work.`;
-
-  return new Promise((resolve) => {
-    const proc = spawn('claude', ['--print', '--model', 'haiku'], {
-      cwd: projectPath,
-      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-clarify' },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    proc.stdin?.write(prompt);
-    proc.stdin?.end();
-
-    let out = '';
-    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    proc.stderr?.on('data', () => {});
-
-    proc.on('close', () => {
-      const trimmed = out.trim();
-      if (trimmed === 'CLEAR' || trimmed.startsWith('CLEAR')) {
-        resolve(null); // No questions needed
-      } else {
-        resolve(trimmed);
-      }
-    });
-    proc.on('error', () => resolve(null));
-    setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 20000);
-  });
-}
-
 // Generate a structured report for an agent's work
 async function generateAgentReport(agent: Agent, task: string, projectPath: string): Promise<AgentReport> {
   const prompt = `Summarize what this agent did, in 2-3 sentences. Be specific about changes made.
@@ -821,134 +669,6 @@ Respond with ONLY valid JSON:
     });
     setTimeout(() => { try { proc.kill(); } catch {} }, 15000);
   });
-}
-
-// Pending orchestrations waiting for user confirmation
-interface PendingOrchestration {
-  team: Team;
-  instruction: string;
-  instructionObj?: Instruction;
-  stage: 'clarifying' | 'composing';
-  recommendedAgents?: { name: string; plugin: string; reason: string; model: string }[];
-}
-const pendingOrchestrations = new Map<string, PendingOrchestration>();
-
-// Main orchestration: plan → execute phases sequentially
-async function orchestrateTeam(team: Team, instruction: string, instructionObj?: Instruction) {
-  const project = team.projectId ? projectsState.get(team.projectId) : undefined;
-  if (!project) {
-    addLog(team.id, undefined, 'error', 'Cannot execute: no project assigned or project not found');
-    return;
-  }
-
-  // Phase -1: Clarifying Questions
-  team.phase = 'analyzing';
-  io.emit('team:updated', team);
-  addLog(team.id, undefined, 'info', 'Orchestrator: analyzing task for ambiguities...');
-
-  const questions = await analyzeForClarification(team, instruction, project.path);
-  if (questions) {
-    addLog(team.id, undefined, 'info', `Orchestrator: needs clarification before proceeding`);
-
-    // Store pending orchestration and emit questions via chat
-    pendingOrchestrations.set(team.id, { team, instruction, instructionObj, stage: 'clarifying' });
-
-    {
-      const msg = {
-        id: randomUUID(),
-        role: 'assistant' as const,
-        kind: 'text' as const,
-        content: `Before I proceed with the task, I have a few questions:\n\n${questions}\n\nPlease answer in the chat, then say **"proceed"** when you're ready for me to execute.`,
-        createdAt: new Date().toISOString(),
-      };
-      messageStore.append(team.id, msg);
-      io.emit('chat:message', { teamId: team.id, message: msg });
-    }
-
-    if (instructionObj) {
-      instructionObj.status = 'clarifying';
-      instructionObj.clarifyingQuestions = questions;
-      io.emit('instruction:updated', instructionObj);
-    }
-
-    team.phase = 'waiting for input';
-    io.emit('team:updated', team);
-    io.emit('chat:questions', { teamId: team.id, questions });
-    return;
-  }
-
-  await executeOrchestration(team, instruction, project, instructionObj);
-}
-
-// Execute after team is already composed (skip composition step)
-async function executeOrchestrationAfterComposition(
-  team: Team, instruction: string, project: Project, instructionObj?: Instruction
-) {
-  addLog(team.id, undefined, 'info', `Orchestrator: team ready — ${team.agents.length} agent(s): ${team.agents.map(a => a.name).join(', ')}`);
-  await executePlanAndPhases(team, instruction, project, instructionObj);
-}
-
-// The actual execution after clarification (or if none needed)
-async function executeOrchestration(
-  team: Team,
-  instruction: string,
-  project: Project,
-  instructionObj?: Instruction
-) {
-  // Phase 0: Team Composition — ask user to confirm agents
-  team.phase = 'composing';
-  io.emit('team:updated', team);
-  addLog(team.id, undefined, 'info', `Orchestrator: analyzing task to recommend agents (${availableAgents.length} in catalog)...`);
-
-  const recommendations = await getAgentRecommendations(team, instruction, project.path);
-
-  if (recommendations.length > 0) {
-    // Format recommendations for the user
-    const agentList = recommendations.map((r, i) =>
-      `${i + 1}. **${r.name}** (${r.plugin}) — ${r.reason}`
-    ).join('\n');
-
-    const chatMsg = `I've analyzed the task and recommend the following agents:\n\n${agentList}\n\n` +
-      `**Reply with:**\n` +
-      `- **"approve"** to use all recommended agents\n` +
-      `- **"remove 2, 4"** to exclude specific agents by number\n` +
-      `- **"add agent-name"** to include an additional agent from the catalog\n` +
-      `- Or describe what you'd like to change`;
-
-    {
-      const msg = {
-        id: randomUUID(),
-        role: 'assistant' as const,
-        kind: 'text' as const,
-        content: chatMsg,
-        createdAt: new Date().toISOString(),
-      };
-      messageStore.append(team.id, msg);
-      io.emit('chat:message', { teamId: team.id, message: msg });
-    }
-
-    pendingOrchestrations.set(team.id, {
-      team,
-      instruction,
-      instructionObj,
-      stage: 'composing',
-      recommendedAgents: recommendations
-    });
-
-    if (instructionObj) {
-      instructionObj.status = 'clarifying';
-      io.emit('instruction:updated', instructionObj);
-    }
-
-    team.phase = 'waiting for team approval';
-    io.emit('team:updated', team);
-    io.emit('chat:questions', { teamId: team.id, questions: chatMsg });
-    addLog(team.id, undefined, 'info', `Orchestrator: recommended ${recommendations.length} agents, waiting for approval`);
-    return;
-  }
-
-  addLog(team.id, undefined, 'info', `Orchestrator: proceeding with existing team — ${team.agents.length} agent(s)`);
-  await executePlanAndPhases(team, instruction, project, instructionObj);
 }
 
 async function dispatchApprovedPlan(teamId: string, planMessageId: string, itemIds: string[]) {
@@ -1198,22 +918,17 @@ app.post('/api/teams', (req, res) => {
 
   io.emit('team:created', newTeam);
 
-  // If initial instructions, dispatch immediately
+  // If initial instructions, store as the first user message in the thread
   if (instructions && typeof instructions === 'string' && instructions.trim()) {
-    const instr: Instruction = {
-      id: `instr-${Date.now()}`,
-      teamId,
-      projectId: projectId || undefined,
+    const userMsg = {
+      id: randomUUID(),
+      role: 'user' as const,
+      kind: 'text' as const,
       content: instructions.trim(),
-      status: 'executing',
       createdAt: new Date().toISOString(),
-      acknowledgedAt: new Date().toISOString()
     };
-    instructionsState.push(instr);
-    io.emit('instruction:created', instr);
-
-    // Orchestrate agents
-    setTimeout(() => orchestrateTeam(newTeam, instructions.trim(), instr), 500);
+    messageStore.append(newTeam.id, userMsg);
+    io.emit('chat:message', { teamId: newTeam.id, message: userMsg });
   }
 
   res.json(newTeam);
