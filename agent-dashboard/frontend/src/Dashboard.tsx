@@ -82,6 +82,19 @@ export default function Dashboard() {
     };
   }, []);
 
+  // When the project filter changes, drop the selection if the current
+  // team doesn't belong to that project so the main section reflects
+  // the visible scope.
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    setSelectedTeamId(prev => {
+      if (!prev) return prev;
+      const team = teams.find(t => t.id === prev);
+      if (!team || team.projectId !== selectedProjectId) return null;
+      return prev;
+    });
+  }, [selectedProjectId, teams]);
+
   const selectedTeam = teams.find(t => t.id === selectedTeamId) || null;
 
   const selectedProject = selectedTeam?.projectId
