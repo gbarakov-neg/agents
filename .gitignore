@@ -25,3 +25,8 @@ node_modules
 
 # Git worktrees
 .worktrees/
+
+# Secrets (never commit)
+.env
+.env.local
+.env.*.local
