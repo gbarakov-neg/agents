@@ -8,6 +8,7 @@ import { existsSync } from 'fs';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { initNotion, isNotionEnabled, createTaskTicket, updateTicketStatus, appendAgentReport, checkAgentTodo } from './notion.js';
+import { defaultProvider, defaultModelFor } from './src/providers/factory';
 
 dotenv.config();
 
@@ -106,6 +107,8 @@ interface Team {
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+  orchestratorProvider?: 'claude' | 'openai';
+  orchestratorModel?: string;
 }
 
 interface WorkflowPhase {
@@ -1124,7 +1127,10 @@ app.post('/api/teams', (req, res) => {
       plugin: agent.plugin
     })),
     createdAt: new Date().toISOString(),
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    orchestratorProvider: req.body.orchestratorProvider ?? defaultProvider(),
+    orchestratorModel: req.body.orchestratorModel
+      ?? defaultModelFor(req.body.orchestratorProvider ?? defaultProvider()),
   };
 
   teamsState.set(teamId, newTeam);
@@ -1300,6 +1306,20 @@ app.patch('/api/teams/:teamId/project', (req, res) => {
   const team = teamsState.get(req.params.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   team.projectId = projectId || undefined;
+  io.emit('team:updated', team);
+  res.json(team);
+});
+
+app.patch('/api/teams/:teamId', (req, res) => {
+  const team = teamsState.get(req.params.teamId);
+  if (!team) return res.status(404).json({ error: 'Team not found' });
+  const { orchestratorProvider, orchestratorModel } = req.body ?? {};
+  if (orchestratorProvider === 'claude' || orchestratorProvider === 'openai') {
+    team.orchestratorProvider = orchestratorProvider;
+  }
+  if (typeof orchestratorModel === 'string' && orchestratorModel.trim()) {
+    team.orchestratorModel = orchestratorModel.trim();
+  }
   io.emit('team:updated', team);
   res.json(team);
 });
