@@ -1,7 +1,12 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Project, AvailableAgent } from '../types';
 
 const API = 'http://localhost:3001';
+
+const PROVIDER_MODELS: Record<'claude' | 'openai', string[]> = {
+  claude: ['sonnet', 'opus', 'haiku'],
+  openai: ['gpt-4o', 'gpt-5', 'o3-mini'],
+};
 
 const MODEL_OPTIONS = [
   { value: 'claude-opus-4-6', label: 'Opus' },
@@ -31,6 +36,10 @@ export default function CreateTeamModal({ projects, availableAgents, defaultProj
   const [instructions, setInstructions] = useState('');
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
+  const [provider, setProvider] = useState<'claude' | 'openai'>('claude');
+  const [model, setModel] = useState<string>('sonnet');
+
+  useEffect(() => { setModel(PROVIDER_MODELS[provider][0]); }, [provider]);
 
   // Group available agents by plugin
   const groupedAgents = useMemo(() => {
@@ -81,6 +90,8 @@ export default function CreateTeamModal({ projects, availableAgents, defaultProj
           projectId: projectId || undefined,
           agents,
           instructions: instructions.trim() || undefined,
+          orchestratorProvider: provider,
+          orchestratorModel: model,
         })
       });
       const team = await res.json();
@@ -219,6 +230,26 @@ export default function CreateTeamModal({ projects, availableAgents, defaultProj
             {!projectId && instructions.trim() && (
               <p className="text-xs text-yellow-400 mt-1">Warning: select a project for agents to execute against</p>
             )}
+          </div>
+
+          {/* Orchestrator provider + model */}
+          <div className="mb-5 space-y-2">
+            <label className="text-xs text-gray-400">Orchestrator provider</label>
+            <div className="flex gap-3">
+              {(['claude', 'openai'] as const).map(p => (
+                <label key={p} className="flex items-center gap-2 text-sm">
+                  <input type="radio" name="provider" checked={provider === p} onChange={() => setProvider(p)} />
+                  {p}
+                </label>
+              ))}
+            </div>
+            <select
+              value={model}
+              onChange={e => setModel(e.target.value)}
+              className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm"
+            >
+              {PROVIDER_MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
           </div>
 
           {/* Actions */}

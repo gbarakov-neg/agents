@@ -1,8 +1,30 @@
+import { useState, useEffect } from 'react';
 import { Team, Project } from '../types';
 
 const API = 'http://localhost:3001';
 
+const PROVIDER_MODELS: Record<'claude' | 'openai', string[]> = {
+  claude: ['sonnet', 'opus', 'haiku'],
+  openai: ['gpt-4o', 'gpt-5', 'o3-mini'],
+};
+
 export default function ControlPanel({ team, projects }: { team: Team; projects: Project[] }) {
+  const [provider, setProvider] = useState<'claude' | 'openai'>(team.orchestratorProvider ?? 'claude');
+  const [model, setModel] = useState<string>(team.orchestratorModel ?? PROVIDER_MODELS[team.orchestratorProvider ?? 'claude'][0]);
+
+  useEffect(() => {
+    setProvider(team.orchestratorProvider ?? 'claude');
+    setModel(team.orchestratorModel ?? PROVIDER_MODELS[team.orchestratorProvider ?? 'claude'][0]);
+  }, [team.id, team.orchestratorProvider, team.orchestratorModel]);
+
+  const saveProvider = async (nextProvider: 'claude' | 'openai', nextModel: string) => {
+    await fetch(`${API}/api/teams/${team.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orchestratorProvider: nextProvider, orchestratorModel: nextModel }),
+    });
+  };
+
   const handlePause = () => fetch(`${API}/api/teams/${team.id}/pause`, { method: 'POST' });
   const handleResume = () => fetch(`${API}/api/teams/${team.id}/resume`, { method: 'POST' });
   const handleShutdown = () => {
@@ -41,6 +63,40 @@ export default function ControlPanel({ team, projects }: { team: Team; projects:
           {projects.map(p => (
             <option key={p.id} value={p.id}>{p.name} — {p.path}</option>
           ))}
+        </select>
+      </div>
+
+      {/* Orchestrator provider + model */}
+      <div className="mb-4 space-y-2">
+        <label className="text-xs text-gray-400 block">Orchestrator</label>
+        <div className="flex gap-3">
+          {(['claude', 'openai'] as const).map(p => (
+            <label key={p} className="flex items-center gap-2 text-sm">
+              <input
+                type="radio"
+                name="orchestrator-provider"
+                checked={provider === p}
+                onChange={() => {
+                  const nextModel = PROVIDER_MODELS[p][0];
+                  setProvider(p);
+                  setModel(nextModel);
+                  saveProvider(p, nextModel);
+                }}
+              />
+              {p}
+            </label>
+          ))}
+        </div>
+        <select
+          value={model}
+          onChange={e => {
+            const nextModel = e.target.value;
+            setModel(nextModel);
+            saveProvider(provider, nextModel);
+          }}
+          className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm"
+        >
+          {PROVIDER_MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
         </select>
       </div>
 
