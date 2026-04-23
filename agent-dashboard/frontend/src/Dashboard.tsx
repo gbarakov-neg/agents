@@ -43,6 +43,11 @@ export default function Dashboard() {
       setTeams(prev => prev.map(t => t.id === team.id ? team : t));
     });
 
+    socket.on('team:deleted', ({ teamId }: { teamId: string }) => {
+      setTeams(prev => prev.filter(t => t.id !== teamId));
+      setSelectedTeamId(prev => (prev === teamId ? null : prev));
+    });
+
     socket.on('agent:updated', ({ teamId, agent }: { teamId: string; agent: Agent }) => {
       setTeams(prev => prev.map(t =>
         t.id === teamId
@@ -69,6 +74,7 @@ export default function Dashboard() {
       socket.off('initial:state');
       socket.off('team:created');
       socket.off('team:updated');
+      socket.off('team:deleted');
       socket.off('agent:updated');
       socket.off('project:created');
       socket.off('project:updated');

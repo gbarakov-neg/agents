@@ -1041,6 +1041,30 @@ app.post('/api/teams/:teamId/shutdown', (req, res) => {
   res.json(team);
 });
 
+app.delete('/api/teams/:teamId', (req, res) => {
+  const teamId = req.params.teamId;
+  const team = teamsState.get(teamId);
+  if (!team) return res.status(404).json({ error: 'Team not found' });
+
+  // Kill running agent processes before removing state
+  for (const agent of team.agents) {
+    const proc = runningProcesses.get(agent.id);
+    if (proc) { try { proc.kill(); } catch {} }
+    runningProcesses.delete(agent.id);
+  }
+
+  teamsState.delete(teamId);
+  phasesState.delete(teamId);
+  messageStore.loadSnapshot(
+    Object.fromEntries(
+      Object.entries(messageStore.snapshot()).filter(([k]) => k !== teamId),
+    ),
+  );
+
+  io.emit('team:deleted', { teamId });
+  res.json({ ok: true });
+});
+
 // ============================================================
 // MESSAGES ROUTER
 // ============================================================

@@ -32,6 +32,11 @@ export default function ControlPanel({ team, projects }: { team: Team; projects:
       fetch(`${API}/api/teams/${team.id}/shutdown`, { method: 'POST' });
     }
   };
+  const handleDelete = () => {
+    if (confirm(`Delete team "${team.name}"? This kills running agents and removes it from the dashboard.`)) {
+      fetch(`${API}/api/teams/${team.id}`, { method: 'DELETE' });
+    }
+  };
 
   const handleProjectChange = (projectId: string) => {
     fetch(`${API}/api/teams/${team.id}/project`, {
@@ -100,27 +105,33 @@ export default function ControlPanel({ team, projects }: { team: Team; projects:
         </select>
       </div>
 
-      <div className="grid grid-cols-3 gap-3 mb-4">
+      <div className="grid grid-cols-4 gap-2 mb-4">
         <button
           onClick={handlePause}
           disabled={team.status !== 'active'}
-          className="px-3 py-2 text-sm bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
+          className="px-2 py-2 text-sm bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
         >
           Pause
         </button>
         <button
           onClick={handleResume}
           disabled={team.status !== 'paused'}
-          className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
+          className="px-2 py-2 text-sm bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
         >
           Resume
         </button>
         <button
           onClick={handleShutdown}
           disabled={team.status === 'complete'}
-          className="px-3 py-2 text-sm bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
+          className="px-2 py-2 text-sm bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
         >
           Shutdown
+        </button>
+        <button
+          onClick={handleDelete}
+          className="px-2 py-2 text-sm bg-red-800 hover:bg-red-900 rounded-lg font-medium transition-colors"
+        >
+          Delete
         </button>
       </div>
 
