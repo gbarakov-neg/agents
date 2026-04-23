@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 import { Team } from '../types';
 import AddAgentModal from './AddAgentModal';
+import { agentColor } from '../lib/agentColor';
 
 const API = 'http://localhost:3001';
 const socket = io(API);
@@ -134,7 +135,15 @@ export default function TeamMonitor({ team }: { team: Team }) {
       </div>
 
       <div className="grid grid-cols-2 gap-4">
-        {team.agents.map(agent => (
+        {team.agents.map(agent => {
+          const color = agentColor(agent.role);
+          const dotCls =
+            agent.status === 'working' ? `${color.dot} animate-pulse` :
+            agent.status === 'blocked' ? 'bg-yellow-400 animate-pulse' :
+            agent.status === 'complete' ? 'bg-green-400' :
+            agent.status === 'failed' ? 'bg-red-400' :
+            'bg-gray-400';
+          return (
           <div key={agent.id} className="flex flex-col">
             <div
               className={`bg-gray-700/60 rounded-lg p-4 border transition-colors group cursor-pointer ${
@@ -147,8 +156,11 @@ export default function TeamMonitor({ team }: { team: Team }) {
             >
               <div className="flex items-start justify-between mb-3">
                 <div>
-                  <div className="font-semibold">{agent.name}</div>
-                  <div className="text-xs text-gray-400">
+                  <div className="font-semibold flex items-center gap-2">
+                    <span className={`w-1.5 h-5 rounded-sm ${color.dot}`} />
+                    {agent.name}
+                  </div>
+                  <div className={`text-xs ${color.fg}`}>
                     {agent.role}
                     {agent.plugin && <span className="text-gray-600 ml-1">({agent.plugin})</span>}
                   </div>
@@ -161,7 +173,7 @@ export default function TeamMonitor({ team }: { team: Team }) {
                   >
                     &times;
                   </button>
-                  <div className={`w-2 h-2 rounded-full ${statusDot[agent.status]}`} />
+                  <div className={`w-2 h-2 rounded-full ${dotCls}`} />
                   <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${statusColors[agent.status]}/20 text-white`}>
                     {agent.status}
                   </span>
@@ -250,7 +262,8 @@ export default function TeamMonitor({ team }: { team: Team }) {
               </div>
             )}
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {team.agents.length === 0 && (

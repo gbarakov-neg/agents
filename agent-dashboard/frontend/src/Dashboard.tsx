@@ -147,9 +147,12 @@ export default function Dashboard() {
             <div className="space-y-4">
               {/* Group teams by project */}
               {(() => {
+                const visible = selectedProjectId
+                  ? teams.filter(t => t.projectId === selectedProjectId)
+                  : teams;
                 const grouped: Record<string, typeof teams> = {};
                 const unassigned: typeof teams = [];
-                for (const t of teams) {
+                for (const t of visible) {
                   if (t.projectId) {
                     if (!grouped[t.projectId]) grouped[t.projectId] = [];
                     grouped[t.projectId].push(t);

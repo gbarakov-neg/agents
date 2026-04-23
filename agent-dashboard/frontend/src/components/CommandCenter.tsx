@@ -80,8 +80,9 @@ export default function CommandCenter({ teamId, teamName }: { teamId: string; te
           <h2 className="text-lg font-bold">Command Center</h2>
           <span className="text-xs text-gray-500">{teamName}</span>
           {streaming && (
-            <span className="text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full font-medium animate-pulse">
-              streaming
+            <span className="flex items-center gap-1.5 text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full font-medium">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+              orchestrator thinking…
             </span>
           )}
         </div>
