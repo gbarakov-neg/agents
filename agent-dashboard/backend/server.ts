@@ -8,7 +8,11 @@ import { existsSync } from 'fs';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { initNotion, isNotionEnabled, createTaskTicket, updateTicketStatus, appendAgentReport, checkAgentTodo } from './notion.js';
-import { defaultProvider, defaultModelFor } from './src/providers/factory';
+import { defaultProvider, defaultModelFor, resolveProvider } from './src/providers/factory';
+import { MessageStore } from './src/messages/store';
+import { createMessagesRouter } from './src/messages/router';
+import { createExecutionAdapter } from './src/messages/executionAdapter';
+import type { Message } from './src/messages/types';
 
 dotenv.config();
 
@@ -145,6 +149,12 @@ const logsState: LogEntry[] = [];
 const resultsState: AgentResult[] = [];
 const runningProcesses = new Map<string, ChildProcess>();
 
+const messageStore = new MessageStore();
+const executionAdapter = createExecutionAdapter({
+  store: messageStore,
+  emit: (event, payload) => io.emit(event, payload),
+});
+
 // ============================================================
 // PERSISTENCE
 // ============================================================
@@ -157,7 +167,7 @@ interface PersistedState {
   teams: Team[];
   instructions: Instruction[];
   results: AgentResult[];
-  chatHistories?: Record<string, ChatMessage[]>;
+  messages?: Record<string, Message[]>;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -180,18 +190,12 @@ async function saveState() {
     }))
   }));
 
-  // Persist chat histories (last 20 messages per team)
-  const chats: Record<string, ChatMessage[]> = {};
-  for (const [teamId, msgs] of chatHistories) {
-    chats[teamId] = msgs.slice(-20);
-  }
-
   const data: PersistedState = {
     projects: Array.from(projectsState.values()),
     teams,
     instructions: instructionsState,
     results: resultsState.slice(-100),
-    chatHistories: chats,
+    messages: messageStore.snapshot(),
   };
 
   if (!existsSync(DATA_DIR)) await mkdir(DATA_DIR, { recursive: true });
@@ -225,12 +229,7 @@ async function loadState() {
     }
     resultsState.push(...(data.results || []));
 
-    // Load chat histories
-    if (data.chatHistories) {
-      for (const [teamId, msgs] of Object.entries(data.chatHistories)) {
-        chatHistories.set(teamId, msgs);
-      }
-    }
+    if (data.messages) messageStore.loadSnapshot(data.messages);
 
     console.log(`Loaded state: ${projectsState.size} projects, ${teamsState.size} teams, ${instructionsState.length} instructions`);
   } catch (err) {
@@ -944,9 +943,48 @@ async function executeOrchestration(
   await executePlanAndPhases(team, instruction, project, instructionObj);
 }
 
+async function dispatchApprovedPlan(teamId: string, planMessageId: string, itemIds: string[]) {
+  const team = teamsState.get(teamId);
+  if (!team || !team.projectId) return;
+  const project = projectsState.get(team.projectId);
+  if (!project) return;
+
+  const planMsg = messageStore.findById(teamId, planMessageId);
+  if (!planMsg || planMsg.kind !== 'plan_proposal') return;
+
+  const selected = planMsg.items.filter(i => itemIds.includes(i.id));
+  const instructionText = [
+    planMsg.summary,
+    ...selected.map(i => `- ${i.title}${i.detail ? `: ${i.detail}` : ''}`),
+  ].join('\n');
+
+  const instr: Instruction = {
+    id: `instr-${Math.random().toString(36).slice(2, 11)}`,
+    teamId,
+    projectId: team.projectId,
+    content: instructionText,
+    status: 'executing',
+    createdAt: new Date().toISOString(),
+  };
+  instructionsState.push(instr);
+  io.emit('instruction:updated', instr);
+
+  executionAdapter.emitEvent(teamId, planMessageId, { phase: 'planning', status: 'started' });
+
+  try {
+    await executePlanAndPhases(team, instructionText, project, instr, planMessageId);
+    executionAdapter.emitEvent(teamId, planMessageId, { phase: 'complete', status: 'completed' });
+  } catch (err) {
+    executionAdapter.emitEvent(teamId, planMessageId, {
+      phase: 'complete', status: 'failed', detail: (err as Error).message,
+    });
+  }
+}
+
 // Core planning + phased execution logic
 async function executePlanAndPhases(
-  team: Team, instruction: string, project: Project, instructionObj?: Instruction
+  team: Team, instruction: string, project: Project,
+  instructionObj?: Instruction, planMessageId?: string
 ) {
 
   // Create Notion ticket
@@ -992,6 +1030,9 @@ async function executePlanAndPhases(
     team.phase = phase.name.toLowerCase();
     phases[i].status = 'in-progress';
     phases[i].startTime = new Date().toISOString();
+    if (planMessageId) executionAdapter.emitEvent(team.id, planMessageId, {
+      phase: phase.name, status: 'started',
+    });
     io.emit('team:updated', team);
     io.emit('phase:updated', { teamId: team.id, phase: phases[i], index: i });
 
@@ -1031,6 +1072,9 @@ async function executePlanAndPhases(
 
     phases[i].status = 'complete';
     phases[i].endTime = new Date().toISOString();
+    if (planMessageId) executionAdapter.emitEvent(team.id, planMessageId, {
+      phase: phase.name, status: 'completed',
+    });
     io.emit('phase:updated', { teamId: team.id, phase: phases[i], index: i });
     addLog(team.id, undefined, 'info', `Orchestrator: phase "${phase.name}" complete`);
   }
@@ -1264,6 +1308,37 @@ app.post('/api/teams/:teamId/shutdown', (req, res) => {
   }
   res.json(team);
 });
+
+// ============================================================
+// MESSAGES ROUTER
+// ============================================================
+
+app.use('/api/teams/:teamId/messages', createMessagesRouter({
+  store: messageStore,
+  getTeam: (teamId) => {
+    const t = teamsState.get(teamId);
+    if (!t) return undefined;
+    return {
+      ...t,
+      orchestratorProvider: t.orchestratorProvider ?? defaultProvider(),
+      orchestratorModel: t.orchestratorModel
+        ?? defaultModelFor(t.orchestratorProvider ?? defaultProvider()),
+    };
+  },
+  getProject: (teamId) => {
+    const t = teamsState.get(teamId);
+    if (!t?.projectId) return undefined;
+    return projectsState.get(t.projectId);
+  },
+  getProvider: (team, project) => resolveProvider(
+    { orchestratorProvider: team.orchestratorProvider, orchestratorModel: team.orchestratorModel },
+    { projectPath: project.path },
+  ),
+  onApproved: (teamId, planMessageId, itemIds) => {
+    dispatchApprovedPlan(teamId, planMessageId, itemIds).catch(err => console.error('dispatch failed', err));
+  },
+  emit: (event, payload) => io.emit(event, payload),
+}));
 
 // ============================================================
 // PROJECTS
