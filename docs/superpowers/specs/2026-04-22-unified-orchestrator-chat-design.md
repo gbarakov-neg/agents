@@ -15,8 +15,11 @@ one orphan component:
 - `OrchestratorChat.tsx` is a floating bubble, no longer imported anywhere.
 - Backend has two distinct endpoints: `POST /api/teams/:id/instructions` drives
   `executePlanAndPhases`, while `POST /api/teams/:id/chat` is advisory-only
-  (its system prompt at `server.ts:1577` literally says "You are advisory —
-  you plan and suggest, agents execute").
+  (its system prompt at `server.ts:1594` literally says "You are advisory —
+  you plan and suggest, agents execute"). The chat endpoint's in-memory
+  message list is stored per-team on the `Team` object (no dedicated
+  top-level `chatState`), while instructions live in the separate
+  top-level `instructionsState` array.
 
 The user experience suffers from three mode buttons, two endpoints, and a
 chat that structurally *cannot* cause work to happen. The end goal is a
@@ -91,9 +94,9 @@ Notes:
   thread below their parent `plan_proposal`, and show which agent is doing
   what in real time.
 - All three kinds persist to the same `messages[]` array per team,
-  replacing today's split between `chatState` and user-facing
-  `instructionsState`. The internal `Instruction` record remains as an
-  execution-engine detail.
+  replacing today's split between the per-team chat message list and
+  the user-facing `instructionsState`. The internal `Instruction` record
+  remains as an execution-engine detail.
 
 ### Section 2 — Backend: one endpoint, one orchestrator loop
 
@@ -103,8 +106,12 @@ Replace `/chat` and `/instructions` with a single endpoint family:
 GET  /api/teams/:teamId/messages
 POST /api/teams/:teamId/messages
 POST /api/teams/:teamId/messages/:msgId/approve
-       body: { itemIds: string[] }
+       body: { itemIds: string[] }           // empty array = decline
 ```
+
+There is no separate `/decline` route. `POST /approve` with `itemIds: []`
+is the decline path: server marks the message `approval: 'declined'`,
+stores `approvedItemIds: []`, and does not call `executePlanAndPhases`.
 
 The old `POST /api/teams/:id/chat`, `POST /api/teams/:id/instructions`, and
 the orphaned `OrchestratorChat.tsx` component are removed. No
@@ -144,7 +151,10 @@ backward-compat shims; nothing else in the repo depends on these.
 
 **What stays:** `createPlan`, `executePlanAndPhases`, per-agent dispatch,
 log streaming, the `Instruction` type (internal), the `chat:questions`
-socket event (repurposed to carry mid-execution `plan_proposal` asks).
+socket event (repurposed to notify clients of mid-execution
+`plan_proposal` asks — payload is the full `Message` envelope for the
+new proposal, so the frontend can render it immediately without a
+follow-up `GET /messages`).
 
 **Provider abstraction** — the new `/messages` handler does not call Claude
 directly. It calls an `OrchestratorProvider`:
@@ -330,7 +340,7 @@ Deletions in one commit:
 - `POST /api/teams/:id/chat`, `POST /api/teams/:id/instructions` handlers
 - The `mode` state machine and mode selector in `CommandCenter.tsx`
 - The "History" tab in `CommandCenter.tsx`
-- The advisory-only chat system prompt at `server.ts:1577`
+- The advisory-only chat system prompt at `server.ts:1594`
 
 ## Open questions
 
