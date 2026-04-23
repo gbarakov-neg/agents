@@ -10,7 +10,9 @@ export default function CommandCenter({ teamId, teamName }: { teamId: string; te
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // If the user has scrolled up to read, don't yank them back on new msgs.
+  const stickToBottomRef = useRef(true);
 
   useEffect(() => {
     fetch(`${API}/api/teams/${teamId}/messages`)
@@ -33,7 +35,21 @@ export default function CommandCenter({ teamId, teamName }: { teamId: string; te
     return () => { socket.off('chat:message', onMsg); };
   }, [teamId]);
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  // Auto-scroll the inner thread container (not the page) when new messages
+  // arrive, but only if the user is already pinned near the bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (stickToBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // Within 40px of the bottom counts as "at bottom" — covers fractional
+    // pixels and small padding differences.
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
 
   const send = async () => {
     const content = input.trim();
@@ -88,7 +104,11 @@ export default function CommandCenter({ teamId, teamName }: { teamId: string; te
         </div>
       </div>
       <div className="p-5">
-        <div className="max-h-96 overflow-y-auto mb-3 p-3 bg-gray-900/50 rounded-lg border border-gray-700">
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="max-h-96 overflow-y-auto mb-3 p-3 bg-gray-900/50 rounded-lg border border-gray-700"
+        >
           {messages.length === 0 ? (
             <p className="text-xs text-gray-500 text-center py-4">
               Tell the orchestrator what you want. It'll reply, or propose a plan you can approve.
@@ -96,7 +116,6 @@ export default function CommandCenter({ teamId, teamName }: { teamId: string; te
           ) : (
             <MessageThread messages={messages} onApprove={approve} />
           )}
-          <div ref={endRef} />
         </div>
         <textarea
           value={input}
