@@ -17,24 +17,38 @@ export default function ProjectSelector({ projects, selectedProjectId, onSelect,
   const [newName, setNewName] = useState('');
   const [newPath, setNewPath] = useState('');
   const [newUrl, setNewUrl] = useState('');
+  const [addError, setAddError] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editPath, setEditPath] = useState('');
   const [editUrl, setEditUrl] = useState('');
 
   const handleAdd = async () => {
-    if (!newName.trim() || !newPath.trim()) return;
-    const res = await fetch(`${API}/api/projects`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newName.trim(), path: newPath.trim(), url: newUrl.trim() || undefined })
-    });
-    const project = await res.json();
-    onAddProject(project);
-    onSelect(project.id);
-    setNewName('');
-    setNewPath('');
-    setNewUrl('');
-    setShowAdd(false);
+    if (!newName.trim()) return;
+    setAddError(null);
+    try {
+      const res = await fetch(`${API}/api/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newName.trim(),
+          path: newPath.trim() || undefined,
+          url: newUrl.trim() || undefined,
+        })
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+      const project = await res.json();
+      onAddProject(project);
+      onSelect(project.id);
+      setNewName('');
+      setNewPath('');
+      setNewUrl('');
+      setShowAdd(false);
+    } catch (err) {
+      setAddError((err as Error).message);
+    }
   };
 
   const handleDelete = async (projectId: string, projectName: string) => {
@@ -105,7 +119,7 @@ export default function ProjectSelector({ projects, selectedProjectId, onSelect,
             />
             <input
               type="text"
-              placeholder="Local path (e.g. /Users/dev/my-api)"
+              placeholder="Local path — optional, auto-created under ~/claude-projects/ if blank"
               value={newPath}
               onChange={e => setNewPath(e.target.value)}
               className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
@@ -117,10 +131,15 @@ export default function ProjectSelector({ projects, selectedProjectId, onSelect,
               onChange={e => setNewUrl(e.target.value)}
               className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
             />
+            {addError && (
+              <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded px-2 py-1">
+                {addError}
+              </div>
+            )}
             <div className="flex gap-2 pt-1">
               <button
                 onClick={handleAdd}
-                disabled={!newName.trim() || !newPath.trim()}
+                disabled={!newName.trim()}
                 className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-sm rounded-lg px-3 py-1.5 font-medium transition-colors"
               >
                 Add

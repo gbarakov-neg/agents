@@ -5,6 +5,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { readdir, readFile, writeFile, stat, mkdir } from 'fs/promises';
 import { join, basename, dirname } from 'path';
 import { existsSync } from 'fs';
+import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -1079,10 +1080,36 @@ app.get('/api/projects', (_req, res) => {
   res.json({ projects: Array.from(projectsState.values()) });
 });
 
-app.post('/api/projects', (req, res) => {
-  const { name, path, url, description } = req.body;
+function slugify(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
+}
+
+app.post('/api/projects', async (req, res) => {
+  const { name, path: rawPath, url, description } = req.body ?? {};
+  if (typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+
+  let resolvedPath = typeof rawPath === 'string' ? rawPath.trim() : '';
+  if (!resolvedPath) {
+    resolvedPath = join(homedir(), 'claude-projects', slugify(name.trim()));
+  }
+
+  try {
+    if (!existsSync(resolvedPath)) await mkdir(resolvedPath, { recursive: true });
+  } catch (err) {
+    return res.status(400).json({ error: `failed to create project directory: ${(err as Error).message}` });
+  }
+
   const id = `proj-${Date.now()}`;
-  const project: Project = { id, name, path, url, description, createdAt: new Date().toISOString() };
+  const project: Project = {
+    id,
+    name: name.trim(),
+    path: resolvedPath,
+    url,
+    description,
+    createdAt: new Date().toISOString(),
+  };
   projectsState.set(id, project);
   io.emit('project:created', project);
   res.json(project);
