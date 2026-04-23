@@ -51,8 +51,13 @@ export function createMessagesRouter(deps: MessagesDeps): Router {
     res.setHeader('Connection', 'keep-alive');
 
     const prompt = buildOrchestratorPrompt({ team, project, thread: deps.store.get(teamId) });
+    // Abort the provider only if the response socket is actually destroyed
+    // before it ends — not on every req.on('close') (which can fire
+    // prematurely behind Vite's dev proxy and kill claude mid-generation).
     const controller = new AbortController();
-    req.on('close', () => controller.abort());
+    res.on('close', () => {
+      if (!res.writableEnded) controller.abort();
+    });
 
     let full = '';
     try {
