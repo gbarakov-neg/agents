@@ -1110,7 +1110,9 @@ export async function createProjectPage(input: {
 
 - [ ] **Step 2: Extend `createTaskTicket` to accept `parentPageId`**
 
-Replace the signature and the `parent:` block. The updated function:
+Replace the signature and the `parent:` / `properties:` blocks. Keep the existing `children:` array **verbatim** — 6 blocks in order: `heading_2 "Instruction"` → `paragraph` with `params.instruction` → `heading_2 "Agents"` → one `to_do` block per agent → `heading_2 "Agent Reports"`.
+
+The updated function shape:
 
 ```ts
 export async function createTaskTicket(params: {
@@ -1137,8 +1139,23 @@ export async function createTaskTicket(params: {
             'Project': { rich_text: [{ text: { content: params.projectName } }] },
           },
       children: [
-        // … keep existing children as before …
-      ]
+        { object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Instruction' } }] } },
+        { object: 'block', type: 'paragraph',
+          paragraph: { rich_text: [{ type: 'text', text: { content: params.instruction } }] } },
+        { object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Agents' } }] } },
+        ...params.agents.map(agent => ({
+          object: 'block' as const,
+          type: 'to_do' as const,
+          to_do: {
+            rich_text: [{ type: 'text' as const, text: { content: agent } }],
+            checked: false,
+          },
+        })),
+        { object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Agent Reports' } }] } },
+      ],
     });
     return page.id;
   } catch (err) {
@@ -1148,25 +1165,57 @@ export async function createTaskTicket(params: {
 }
 ```
 
-(Preserve the existing `children` array verbatim — Instruction heading, agents to-do list, Agent Reports heading.)
+Rationale: when a task is a CHILD of the project page, Notion doesn't let us attach database properties like `Status` / `Team` / `Project` — those only apply when the parent is the database. In child-page mode, the block content already covers that info and a page-level `title` property replaces `Name`.
 
-Rationale: when we create a task as a CHILD of the project page, Notion doesn't let us attach database properties like `Status` or `Team` — those only apply when the parent is the database. In child-page mode, we use the block content (which already covers the same info) and a page-level `title` property.
+- [ ] **Step 3: Add `appendProjectBlocks` for appending to an existing page**
 
-- [ ] **Step 3: Typecheck**
+Below `createProjectPage`, add a small helper so sinks can append blocks to a project page:
+
+```ts
+export async function appendProjectBlocks(pageId: string, blocks: any[]): Promise<boolean> {
+  if (!notion) return false;
+  try {
+    await notion.blocks.children.append({ block_id: pageId, children: blocks });
+    return true;
+  } catch (err) {
+    console.error('Notion: failed to append blocks:', err);
+    return false;
+  }
+}
+```
+
+- [ ] **Step 4: Add `archiveProjectPage` for project deletion**
+
+Below `appendProjectBlocks`:
+
+```ts
+export async function archiveProjectPage(pageId: string): Promise<boolean> {
+  if (!notion) return false;
+  try {
+    await notion.pages.update({ page_id: pageId, archived: true });
+    return true;
+  } catch (err) {
+    console.error('Notion: failed to archive page:', err);
+    return false;
+  }
+}
+```
+
+- [ ] **Step 5: Typecheck**
 
 Run: `cd agent-dashboard/backend && npx tsc --noEmit`
 Expected: 0 errors.
 
-- [ ] **Step 4: Run backend test suite (no new tests, but ensure no regressions)**
+- [ ] **Step 6: Run backend test suite (no new tests, but ensure no regressions)**
 
 Run: `cd agent-dashboard/backend && npm test`
 Expected: all green.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add agent-dashboard/backend/notion.ts
-git commit -m "feat(notion): add createProjectPage; parentPageId option on task ticket"
+git commit -m "feat(notion): add createProjectPage, appendProjectBlocks, archiveProjectPage; parentPageId on task ticket"
 ```
 
 ---
@@ -1186,12 +1235,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const {
   createProjectPageMock, createTaskTicketMock, updateTicketStatusMock,
-  appendAgentReportMock,
+  appendAgentReportMock, appendProjectBlocksMock, archiveProjectPageMock,
 } = vi.hoisted(() => ({
   createProjectPageMock: vi.fn(),
   createTaskTicketMock: vi.fn(),
   updateTicketStatusMock: vi.fn(),
   appendAgentReportMock: vi.fn(),
+  appendProjectBlocksMock: vi.fn(),
+  archiveProjectPageMock: vi.fn(),
 }));
 
 vi.mock('../../../notion.js', () => ({
@@ -1199,6 +1250,8 @@ vi.mock('../../../notion.js', () => ({
   createTaskTicket: createTaskTicketMock,
   updateTicketStatus: updateTicketStatusMock,
   appendAgentReport: appendAgentReportMock,
+  appendProjectBlocks: appendProjectBlocksMock,
+  archiveProjectPage: archiveProjectPageMock,
   checkAgentTodo: vi.fn(),
   isNotionEnabled: () => true,
   initNotion: vi.fn(),
@@ -1214,16 +1267,18 @@ describe('NotionProjectDoc', () => {
     createTaskTicketMock.mockReset();
     updateTicketStatusMock.mockReset();
     appendAgentReportMock.mockReset();
+    appendProjectBlocksMock.mockReset();
+    archiveProjectPageMock.mockReset();
     sink = new NotionProjectDoc();
   });
 
-  it('createProject stores the Notion page id and remembers it', async () => {
+  it('createProject stores page id and project name and remembers both', async () => {
     createProjectPageMock.mockResolvedValue('page-abc');
     await sink.createProject({ projectId: 'p1', name: 'App', path: '/p' });
-    // appendTask should pass the stored page id as parentPageId
     await sink.appendTask('p1', { title: 't', items: ['a'], agents: ['frontend-developer'] });
     expect(createTaskTicketMock).toHaveBeenCalledWith(expect.objectContaining({
       parentPageId: 'page-abc',
+      projectName: 'App',   // real name, not the opaque projectId
     }));
   });
 
@@ -1234,6 +1289,36 @@ describe('NotionProjectDoc', () => {
       parentPageId: undefined,
     }));
     expect(ticketRef).toBe('tkt-1');
+  });
+
+  it('appendBrief calls appendProjectBlocks with the stored page id', async () => {
+    createProjectPageMock.mockResolvedValue('page-abc');
+    await sink.createProject({ projectId: 'p1', name: 'App', path: '/p' });
+    await sink.appendBrief('p1', 'Users are chefs');
+    expect(appendProjectBlocksMock).toHaveBeenCalledWith('page-abc', expect.any(Array));
+    const [, blocks] = appendProjectBlocksMock.mock.calls[0];
+    const asJson = JSON.stringify(blocks);
+    expect(asJson).toContain('Users are chefs');
+  });
+
+  it('appendBrief is a no-op when the project has no stored page id', async () => {
+    await sink.appendBrief('unknown', 'x');
+    expect(appendProjectBlocksMock).not.toHaveBeenCalled();
+  });
+
+  it('appendTeamComposition appends a heading + one bullet per role', async () => {
+    createProjectPageMock.mockResolvedValue('page-abc');
+    await sink.createProject({ projectId: 'p1', name: 'App', path: '/p' });
+    await sink.appendTeamComposition('p1', [
+      { role: 'frontend-developer', rationale: 'UI' },
+      { role: 'backend-architect', rationale: 'API' },
+    ]);
+    expect(appendProjectBlocksMock).toHaveBeenCalledWith('page-abc', expect.any(Array));
+    const asJson = JSON.stringify(appendProjectBlocksMock.mock.calls[0][1]);
+    expect(asJson).toContain('frontend-developer');
+    expect(asJson).toContain('backend-architect');
+    expect(asJson).toContain('UI');
+    expect(asJson).toContain('API');
   });
 
   it('updateTaskStatus passes the ticketRef through', async () => {
@@ -1253,6 +1338,22 @@ describe('NotionProjectDoc', () => {
     });
     expect(appendAgentReportMock).not.toHaveBeenCalled();
   });
+
+  it('deleteProject archives the page and forgets the mapping', async () => {
+    createProjectPageMock.mockResolvedValue('page-abc');
+    await sink.createProject({ projectId: 'p1', name: 'App', path: '/p' });
+    await sink.deleteProject('p1');
+    expect(archiveProjectPageMock).toHaveBeenCalledWith('page-abc');
+    // follow-up appendBrief should no-op now (mapping cleared)
+    appendProjectBlocksMock.mockReset();
+    await sink.appendBrief('p1', 'should-not-appear');
+    expect(appendProjectBlocksMock).not.toHaveBeenCalled();
+  });
+
+  it('deleteProject without a prior createProject is a no-op', async () => {
+    await sink.deleteProject('never-existed');
+    expect(archiveProjectPageMock).not.toHaveBeenCalled();
+  });
 });
 ```
 
@@ -1269,14 +1370,20 @@ File: `agent-dashboard/backend/src/docs/notionSink.ts`
 import {
   createProjectPage, createTaskTicket, updateTicketStatus,
   appendAgentReport as notionAppendReport,
+  appendProjectBlocks, archiveProjectPage,
 } from '../../notion.js';
 import type {
   ProjectDocSink, ProjectInput, TeamCompositionEntry,
   AppendTaskInput, AgentReport,
 } from './types';
 
+interface ProjectEntry {
+  pageId: string;
+  projectName: string;
+}
+
 export class NotionProjectDoc implements ProjectDocSink {
-  private readonly pageIds = new Map<string, string>();
+  private readonly projects = new Map<string, ProjectEntry>();
 
   async createProject(input: ProjectInput): Promise<void> {
     const pageId = await createProjectPage({
@@ -1285,34 +1392,59 @@ export class NotionProjectDoc implements ProjectDocSink {
       url: input.url,
       description: input.description,
     });
-    if (pageId) this.pageIds.set(input.projectId, pageId);
+    if (pageId) {
+      this.projects.set(input.projectId, { pageId, projectName: input.name });
+    }
   }
 
   async appendBrief(projectId: string, userMessage: string): Promise<void> {
-    // Notion append-block requires a block-children request; we accept that
-    // for v1 the brief appears as a separate task-like ticket is overkill,
-    // so we append nothing here and rely on the project page having the
-    // "Brief" heading. Follow-up: upgrade to a proper blocks.children.append.
-    // This call is intentionally a no-op for the Notion sink in v1 — logged for
-    // visibility so users know it isn't lost in the ether during local dev.
-    // (Local sink persists the brief in project.md.)
-    void projectId; void userMessage;
+    const entry = this.projects.get(projectId);
+    if (!entry) return;
+    const ts = new Date().toISOString();
+    const blocks = [
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [{ type: 'text', text: { content: `[${ts}] ${userMessage}` } }],
+        },
+      },
+    ];
+    await appendProjectBlocks(entry.pageId, blocks);
   }
 
   async appendTeamComposition(projectId: string, entries: TeamCompositionEntry[]): Promise<void> {
-    // Same rationale as appendBrief — v1 no-op on Notion; local sink carries it.
-    void projectId; void entries;
+    const entry = this.projects.get(projectId);
+    if (!entry) return;
+    const ts = new Date().toISOString();
+    const blocks: any[] = [
+      {
+        object: 'block',
+        type: 'heading_3',
+        heading_3: {
+          rich_text: [{ type: 'text', text: { content: `Team composition — ${ts}` } }],
+        },
+      },
+      ...entries.map(e => ({
+        object: 'block' as const,
+        type: 'bulleted_list_item' as const,
+        bulleted_list_item: {
+          rich_text: [{ type: 'text' as const, text: { content: `${e.role} — ${e.rationale}` } }],
+        },
+      })),
+    ];
+    await appendProjectBlocks(entry.pageId, blocks);
   }
 
   async appendTask(projectId: string, input: AppendTaskInput): Promise<{ ticketRef?: string }> {
-    const parentPageId = this.pageIds.get(projectId);
+    const entry = this.projects.get(projectId);
     const pageId = await createTaskTicket({
       title: input.title,
-      teamName: '',              // project-doc abstraction omits these;
-      projectName: projectId,    // the legacy fields are optional-ish
+      teamName: '',
+      projectName: entry?.projectName ?? projectId,
       instruction: input.items.join('\n'),
       agents: input.agents,
-      parentPageId,
+      parentPageId: entry?.pageId,
     });
     return { ticketRef: pageId ?? undefined };
   }
@@ -1336,19 +1468,18 @@ export class NotionProjectDoc implements ProjectDocSink {
   }
 
   async deleteProject(projectId: string): Promise<void> {
-    // Archive is handled via Notion UI; v1 sink just drops the local mapping.
-    // A follow-up spec covers calling pages.update({ page_id, archived: true }).
-    this.pageIds.delete(projectId);
+    const entry = this.projects.get(projectId);
+    if (!entry) return;
+    await archiveProjectPage(entry.pageId);
+    this.projects.delete(projectId);
   }
 }
 ```
 
-**Note for the planner:** `appendBrief` and `appendTeamComposition` are intentional no-ops in the Notion sink v1 because appending a single block to an existing Notion page requires a `blocks.children.append` call that wasn't part of the `notion.ts` surface pre-existing. The local sink captures the full brief + composition. Upgrading Notion to real block-append is a follow-up task, not part of this plan, and the spec already treats docs as best-effort.
-
 - [ ] **Step 4: Run — tests pass**
 
 Run: `cd agent-dashboard/backend && npx vitest run src/docs/__tests__/notionSink.test.ts`
-Expected: 5 passed.
+Expected: 10 passed.
 
 Full suite + typecheck:
 `cd agent-dashboard/backend && npm test && npx tsc --noEmit`
@@ -1359,7 +1490,7 @@ Expected: all green.
 ```bash
 git add agent-dashboard/backend/src/docs/notionSink.ts \
         agent-dashboard/backend/src/docs/__tests__/notionSink.test.ts
-git commit -m "feat(docs): NotionProjectDoc sink wrapping notion.ts"
+git commit -m "feat(docs): NotionProjectDoc with real block-append and page archive"
 ```
 
 ---
@@ -1461,11 +1592,19 @@ No dedicated test — observed by the persistence round-trip test in Task 13 and
 
 In `agent-dashboard/backend/server.ts`, find the `interface Instruction {` block (around line 59–69) and replace `notionPageId?: string;` with `docTicketRef?: string;`.
 
-- [ ] **Step 2: Update the single write site**
+- [ ] **Step 2: Update every site that references the local/field**
 
-Search for `.notionPageId = notionPageId` in `server.ts` (one occurrence). Replace with `.docTicketRef = docTicketRef` and rename the local variable `notionPageId` → `docTicketRef` in that function (the current `executePlanAndPhases`).
+Inside `executePlanAndPhases` the local variable `notionPageId` and the field assignment appear in **six places**. Rename them consistently (local var: `notionPageId` → `docTicketRef`; field: `instructionObj.notionPageId` → `instructionObj.docTicketRef`):
 
-Search for any remaining uses of the local `notionPageId` variable inside `executePlanAndPhases` and rename consistently. The direct `notion.ts` calls (`appendAgentReport(notionPageId, …)`, `updateTicketStatus(notionPageId, …)`) will be replaced in Task 13 — leave them referencing the renamed local for now.
+- Declaration (~line 720): `let notionPageId: string | null = null;` → `let docTicketRef: string | null = null;`
+- Assignment from Notion (~line 723): `notionPageId = await createTaskTicket({…});` → `docTicketRef = await createTaskTicket({…});`
+- Field write (~line 731): `instructionObj.notionPageId = notionPageId;` → `instructionObj.docTicketRef = docTicketRef;`
+- Log gate (~line 733): `if (notionPageId) addLog(…)` → `if (docTicketRef) addLog(…)`
+- Per-agent-report block (~line 785): `if (notionPageId) { await appendAgentReport(notionPageId, {…}); await checkAgentTodo(notionPageId, agent.name); }` — rename both references; the whole block is replaced in Task 13, but until then keep it syntactically correct.
+- End-of-execution status block (~line 812): `if (notionPageId) { const anyFailed = …; await updateTicketStatus(notionPageId, anyFailed ? 'Failed' : 'Done'); addLog(…) }` — rename.
+- Chat summary string (~line 824): `(notionPageId ? '\n\n📋 Notion ticket has been updated with full reports.' : '')` — rename the variable. (The user-visible copy can stay as-is for this task; Task 13 will touch it.)
+
+The direct `notion.ts` calls (`appendAgentReport`, `checkAgentTodo`, `updateTicketStatus`) stay wired to the local in this task — they're replaced with sink calls in Task 13.
 
 - [ ] **Step 3: Add load-time migration in `loadState`**
 
@@ -1647,7 +1786,7 @@ try {
 }
 ```
 
-Drop the `checkAgentTodo` call entirely — it was a Notion-only nicety that doesn't generalise to local markdown. (Follow-up note: add an optional "agents to-do" section on the local task markdown later if it proves useful.)
+Drop the `checkAgentTodo` call entirely — it was a Notion-only nicety that doesn't generalise to local markdown. Mention this explicitly in the manual smoke step (see Task 17). Follow-up: add an optional "agents to-do" section on the local task markdown later if it proves useful.
 
 - [ ] **Step 3: Replace `updateTicketStatus`**
 
@@ -1822,7 +1961,244 @@ git commit -m "feat(server): dispatchAgentAdds + kind-based onApproved branch + 
 
 ---
 
-### Task 15: Frontend — extend `PlanProposalItem` with `kind` and empty-state hint
+### Task 15: Backend integration tests — add_agent and Notion-parented task flows
+
+The spec §8 requires two end-to-end backend integration tests that aren't covered by the unit tests in prior tasks. They exercise the `onApproved` branching inside the mounted messages router, the sink write path, and the `execution_status` emit together.
+
+**Files:**
+- Create: `agent-dashboard/backend/src/messages/__tests__/intakeFlow.test.ts`
+
+- [ ] **Step 1: Write the failing integration test — add_agent flow**
+
+Build an isolated Express app mounting the real `createMessagesRouter` + a real `MessageStore` + a stub provider that returns an `add_agent` plan. The test asserts that approving two items produces: both agents added to the team, an `execution_status` message appended via the adapter, and `team:updated` emitted via the injected emit callback.
+
+File: `agent-dashboard/backend/src/messages/__tests__/intakeFlow.test.ts`
+
+```ts
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import request from 'supertest';
+import { MessageStore } from '../store';
+import { createExecutionAdapter } from '../executionAdapter';
+import { createMessagesRouter } from '../router';
+import type { OrchestratorProvider } from '../../providers/types';
+
+interface TestAgent { id: string; role: string; name: string }
+interface TestTeam { id: string; name: string; projectId?: string; agents: TestAgent[]; orchestratorProvider: 'claude' | 'openai'; orchestratorModel: string }
+
+function buildApp(opts: {
+  team: TestTeam;
+  availableAgents: { name: string; description: string }[];
+  providerReply: string;
+  emitSpy?: (event: string, payload: unknown) => void;
+  onApprovedImpl?: (teamId: string, planMessageId: string, itemIds: string[]) => void;
+}) {
+  const app = express();
+  app.use(express.json());
+  const store = new MessageStore();
+  const emits: Array<{ event: string; payload: unknown }> = [];
+  const adapter = createExecutionAdapter({
+    store,
+    emit: (event, payload) => {
+      emits.push({ event, payload });
+      opts.emitSpy?.(event, payload);
+    },
+  });
+  const provider: OrchestratorProvider = {
+    async streamTurn({ onChunk }) { onChunk(opts.providerReply); return { fullText: opts.providerReply }; },
+  };
+  app.use('/api/teams/:teamId/messages', createMessagesRouter({
+    store,
+    getTeam: () => opts.team,
+    getProject: () => ({ id: 'p1', name: 'Smoke', path: '/tmp' }),
+    getAvailableAgents: () => opts.availableAgents,
+    getProvider: () => provider,
+    onApproved: opts.onApprovedImpl ?? (() => {}),
+    emit: (event, payload) => {
+      emits.push({ event, payload });
+      opts.emitSpy?.(event, payload);
+    },
+  }));
+  return { app, store, adapter, emits };
+}
+
+describe('intake → add_agent approval flow', () => {
+  it('adds approved agents, emits team:updated, and appends execution_status', async () => {
+    const team: TestTeam = {
+      id: 't1', name: 'Alpha', projectId: 'p1', agents: [],
+      orchestratorProvider: 'claude', orchestratorModel: 'sonnet',
+    };
+    const availableAgents = [
+      { name: 'frontend-developer', description: 'UI' },
+      { name: 'backend-architect', description: 'API' },
+    ];
+    const plan = {
+      kind: 'plan_proposal', summary: 'team',
+      items: [
+        { id: 'a', title: 'frontend-developer', priority: 'high', kind: 'add_agent', detail: 'UI work' },
+        { id: 'b', title: 'backend-architect', priority: 'high', kind: 'add_agent', detail: 'API work' },
+      ],
+    };
+
+    // onApproved body mirrors server.ts dispatchAgentAdds semantics.
+    const onApprovedImpl = vi.fn(async (teamId: string, planMessageId: string, itemIds: string[]) => {
+      void teamId;
+      const msg = store.findById(teamId, planMessageId);
+      if (!msg || msg.kind !== 'plan_proposal') return;
+      for (const item of msg.items.filter(i => itemIds.includes(i.id))) {
+        team.agents.push({
+          id: `agent-${Math.random().toString(36).slice(2, 9)}`,
+          role: item.title,
+          name: item.title.split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' '),
+        });
+      }
+      adapter.emitEvent(teamId, planMessageId, {
+        phase: 'team', status: 'completed',
+        detail: `Added: ${msg.items.filter(i => itemIds.includes(i.id)).map(i => i.title).join(', ')}`,
+      });
+    });
+
+    const { app, store, adapter, emits } = buildApp({
+      team, availableAgents,
+      providerReply: '```json\n' + JSON.stringify(plan) + '\n```',
+      onApprovedImpl: (a, b, c) => { void onApprovedImpl(a, b, c); },
+    });
+
+    // Turn 1: user sends goal → provider replies with plan_proposal
+    await request(app).post('/api/teams/t1/messages').send({ content: 'build me a landing page' });
+    const thread = store.get('t1');
+    const proposal = thread.find(m => m.kind === 'plan_proposal');
+    expect(proposal).toBeDefined();
+
+    // Turn 2: approve both items
+    await request(app)
+      .post(`/api/teams/t1/messages/${proposal!.id}/approve`)
+      .send({ itemIds: ['a', 'b'] });
+
+    // Verify: both agents on the team
+    expect(team.agents).toHaveLength(2);
+    expect(team.agents.map(a => a.role).sort()).toEqual(['backend-architect', 'frontend-developer']);
+
+    // Verify: execution_status row in the thread, linked to the proposal
+    const statusRow = store.get('t1').find(m => m.kind === 'execution_status');
+    expect(statusRow).toBeDefined();
+    if (statusRow && statusRow.kind === 'execution_status') {
+      expect(statusRow.planMessageId).toBe(proposal!.id);
+      expect(statusRow.status).toBe('completed');
+    }
+
+    // Verify: chat:message emits included the execution_status row
+    const emittedKinds = emits
+      .filter(e => e.event === 'chat:message')
+      .map(e => (e.payload as { message: { kind: string } }).message.kind);
+    expect(emittedKinds).toContain('execution_status');
+
+    expect(onApprovedImpl).toHaveBeenCalled();
+  });
+});
+```
+
+- [ ] **Step 2: Run — FAIL**
+
+Run: `cd agent-dashboard/backend && npx vitest run src/messages/__tests__/intakeFlow.test.ts`
+Expected: FAIL the first time (test references `getAvailableAgents`; if Task 5 landed this compiles; if the test ordering is off, it points to the right missing piece).
+
+- [ ] **Step 3: Since this test uses existing primitives only, it should pass without new production code — it validates that the seams cooperate.**
+
+If the test fails because of a missing piece, trace the failure:
+- `getAvailableAgents` missing on deps → Task 5 wasn't applied; stop and fix.
+- `store.findById` not returning the plan → parser rejected the payload; re-check Task 2 homogeneity logic.
+- execution_status never appended → `adapter.emitEvent` wasn't called from `onApprovedImpl`; re-read the test's simulation of `dispatchAgentAdds`.
+
+Run: `cd agent-dashboard/backend && npx vitest run src/messages/__tests__/intakeFlow.test.ts`
+Expected: 1 passed.
+
+- [ ] **Step 4: Add the Notion-parented work-flow integration test**
+
+Append to the same file a second `describe` block that mocks `../../../notion.js` and verifies: `createProjectPage` is called when the sink factory is invoked; `createTaskTicket` is called with `parentPageId` equal to the created project's page id; `updateTicketStatus` is called on execution finish.
+
+```ts
+import { resolveProjectDoc } from '../../docs/factory';
+
+const {
+  createProjectPageMock, createTaskTicketMock, updateTicketStatusMock, appendAgentReportMock,
+  appendProjectBlocksMock, archiveProjectPageMock,
+} = vi.hoisted(() => ({
+  createProjectPageMock: vi.fn(),
+  createTaskTicketMock: vi.fn(),
+  updateTicketStatusMock: vi.fn(),
+  appendAgentReportMock: vi.fn(),
+  appendProjectBlocksMock: vi.fn(),
+  archiveProjectPageMock: vi.fn(),
+}));
+
+vi.mock('../../../notion.js', () => ({
+  createProjectPage: createProjectPageMock,
+  createTaskTicket: createTaskTicketMock,
+  updateTicketStatus: updateTicketStatusMock,
+  appendAgentReport: appendAgentReportMock,
+  appendProjectBlocks: appendProjectBlocksMock,
+  archiveProjectPage: archiveProjectPageMock,
+  checkAgentTodo: vi.fn(),
+  isNotionEnabled: () => true,
+  initNotion: vi.fn(),
+}));
+
+describe('Notion-parented project doc flow', () => {
+  beforeEach(() => {
+    createProjectPageMock.mockReset();
+    createTaskTicketMock.mockReset();
+    updateTicketStatusMock.mockReset();
+    appendAgentReportMock.mockReset();
+    appendProjectBlocksMock.mockReset();
+    archiveProjectPageMock.mockReset();
+  });
+
+  it('creates the project page, parents task tickets under it, updates status', async () => {
+    createProjectPageMock.mockResolvedValue('page-xyz');
+    createTaskTicketMock.mockResolvedValue('ticket-1');
+
+    const sink = resolveProjectDoc({ localRootDir: '/tmp-ignored' });
+    await sink.createProject({ projectId: 'p1', name: 'Smoke', path: '/tmp' });
+    expect(createProjectPageMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'Smoke', path: '/tmp' }));
+
+    const { ticketRef } = await sink.appendTask('p1', {
+      title: 'Hero', items: ['Hero section', 'CTA'], agents: ['frontend-developer'],
+    });
+    expect(createTaskTicketMock).toHaveBeenCalledWith(expect.objectContaining({
+      parentPageId: 'page-xyz',
+      projectName: 'Smoke',
+    }));
+    expect(ticketRef).toBe('ticket-1');
+
+    await sink.updateTaskStatus('p1', ticketRef, 'Done');
+    expect(updateTicketStatusMock).toHaveBeenCalledWith('ticket-1', 'Done');
+
+    await sink.appendTeamComposition('p1', [{ role: 'frontend-developer', rationale: 'UI' }]);
+    expect(appendProjectBlocksMock).toHaveBeenCalledWith('page-xyz', expect.any(Array));
+  });
+});
+```
+
+- [ ] **Step 5: Run — all pass**
+
+Run: `cd agent-dashboard/backend && npx vitest run src/messages/__tests__/intakeFlow.test.ts`
+Expected: 2 passed.
+
+Full suite + typecheck:
+`cd agent-dashboard/backend && npm test && npx tsc --noEmit`
+Expected: all green.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add agent-dashboard/backend/src/messages/__tests__/intakeFlow.test.ts
+git commit -m "test(messages): integration tests for add_agent approval and Notion-parented tasks"
+```
+
+---
+
+### Task 16: Frontend — extend `PlanProposalItem` with `kind` and empty-state hint
 
 **Files:**
 - Modify: `agent-dashboard/frontend/src/types.ts`
@@ -1894,7 +2270,7 @@ git commit -m "feat(frontend): PlanItemKind type + empty-team CommandCenter hint
 
 ---
 
-### Task 16: Manual acceptance smoke
+### Task 17: Manual acceptance smoke
 
 Not a code task — the verification checklist before declaring done. Run from the worktree:
 
@@ -1913,6 +2289,8 @@ Not a code task — the verification checklist before declaring done. Run from t
 - [ ] **Work proposal** — send *"Now draft the hero section"*. Expect a `plan_proposal` with `kind: 'work'` items. Approve two. Confirm execution_status rows appear, agents start running, and `data/projects/proj-<id>/tasks/<timestamp>-…md` contains a task entry.
 - [ ] **Notion-on (optional, requires `NOTION_TOKEN` + `NOTION_DATABASE_ID`)** — set env, restart backend, create a new project, and verify a project page appears in the configured Notion database and that approved work proposals create child pages under it.
 - [ ] **Regression** — previously-created projects still load; old `Instruction.notionPageId` records (if any exist in persisted state) are rewritten to `docTicketRef` during `loadState`. Inspect `data/state.json` after one save-cycle to confirm.
+- [ ] **`checkAgentTodo` removal** — the old Notion flow auto-ticked per-agent to-do checkboxes on the task ticket when each agent completed. This plan drops that call (see Task 13 Step 2). If you have a past-approved task ticket in Notion, its to-do checkboxes will remain as you left them. Not a regression — intentional scope reduction; a replacement "progress per agent" section on both sinks is a follow-up.
+- [ ] **Empty-state hint** — the `CommandCenter` hint for empty teams is only visible while the thread is empty. Once the user sends the first message, the normal thread replaces it. Don't be surprised if you see it flash, then disappear.
 
 If any step fails, **do not declare done** — triage and amend.
 
