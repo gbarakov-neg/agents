@@ -7,9 +7,9 @@ import MetricsPanel from './components/MetricsPanel';
 import ControlPanel from './components/ControlPanel';
 import LogsPanel from './components/LogsPanel';
 import ProjectSelector from './components/ProjectSelector';
-import InstructionsPanel from './components/InstructionsPanel';
 import CreateTeamModal from './components/CreateTeamModal';
-import OrchestratorChat from './components/OrchestratorChat';
+import CommandCenter from './components/CommandCenter';
+import NotionSettings from './components/NotionSettings';
 
 const socket: Socket = io('http://localhost:3001');
 
@@ -43,6 +43,11 @@ export default function Dashboard() {
       setTeams(prev => prev.map(t => t.id === team.id ? team : t));
     });
 
+    socket.on('team:deleted', ({ teamId }: { teamId: string }) => {
+      setTeams(prev => prev.filter(t => t.id !== teamId));
+      setSelectedTeamId(prev => (prev === teamId ? null : prev));
+    });
+
     socket.on('agent:updated', ({ teamId, agent }: { teamId: string; agent: Agent }) => {
       setTeams(prev => prev.map(t =>
         t.id === teamId
@@ -59,17 +64,36 @@ export default function Dashboard() {
       setProjects(prev => prev.filter(p => p.id !== projectId));
     });
 
+    socket.on('project:updated', (project: Project) => {
+      setProjects(prev => prev.map(p => p.id === project.id ? project : p));
+    });
+
     return () => {
       socket.off('connect');
       socket.off('disconnect');
       socket.off('initial:state');
       socket.off('team:created');
       socket.off('team:updated');
+      socket.off('team:deleted');
       socket.off('agent:updated');
       socket.off('project:created');
+      socket.off('project:updated');
       socket.off('project:deleted');
     };
   }, []);
+
+  // When the project filter changes, drop the selection if the current
+  // team doesn't belong to that project so the main section reflects
+  // the visible scope.
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    setSelectedTeamId(prev => {
+      if (!prev) return prev;
+      const team = teams.find(t => t.id === prev);
+      if (!team || team.projectId !== selectedProjectId) return null;
+      return prev;
+    });
+  }, [selectedProjectId, teams]);
 
   const selectedTeam = teams.find(t => t.id === selectedTeamId) || null;
 
@@ -95,13 +119,15 @@ export default function Dashboard() {
             projects={projects}
             selectedProjectId={selectedProjectId}
             onSelect={(id) => setSelectedProjectId(id)}
-            onAddProject={(project) => setProjects(prev => [...prev, project])}
           />
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400' : 'bg-red-400'}`} />
-          <span className="text-sm text-gray-400">{connected ? 'Connected' : 'Disconnected'}</span>
+        <div className="flex items-center gap-3 relative">
+          <NotionSettings />
+          <div className="flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400' : 'bg-red-400'}`} />
+            <span className="text-sm text-gray-400">{connected ? 'Connected' : 'Disconnected'}</span>
+          </div>
         </div>
       </header>
 
@@ -134,9 +160,12 @@ export default function Dashboard() {
             <div className="space-y-4">
               {/* Group teams by project */}
               {(() => {
+                const visible = selectedProjectId
+                  ? teams.filter(t => t.projectId === selectedProjectId)
+                  : teams;
                 const grouped: Record<string, typeof teams> = {};
                 const unassigned: typeof teams = [];
-                for (const t of teams) {
+                for (const t of visible) {
                   if (t.projectId) {
                     if (!grouped[t.projectId]) grouped[t.projectId] = [];
                     grouped[t.projectId].push(t);
@@ -226,17 +255,31 @@ export default function Dashboard() {
             <>
               {/* Project badge */}
               {selectedProject && (
-                <div className="flex items-center gap-2 text-sm">
+                <div className="flex items-center gap-2 text-sm flex-wrap">
                   <span className="text-gray-500">Project:</span>
                   <span className="bg-indigo-500/20 text-indigo-300 px-2.5 py-1 rounded-md font-medium">
                     {selectedProject.name}
                   </span>
                   <span className="text-gray-600 text-xs font-mono">{selectedProject.path}</span>
+                  {selectedProject.url && (
+                    <a
+                      href={selectedProject.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-blue-400 hover:text-blue-300 bg-blue-500/10 px-2 py-0.5 rounded"
+                    >
+                      {selectedProject.url}
+                    </a>
+                  )}
                 </div>
               )}
 
-              {/* Instructions — prominent, full-width */}
-              <InstructionsPanel teamId={selectedTeam.id} teamName={selectedTeam.name} />
+              {/* Command Center — unified chat + instructions */}
+              <CommandCenter
+                teamId={selectedTeam.id}
+                teamName={selectedTeam.name}
+                teamAgentCount={selectedTeam.agents.length}
+              />
 
               <TeamMonitor team={selectedTeam} />
 
@@ -268,10 +311,6 @@ export default function Dashboard() {
         />
       )}
 
-      {/* Orchestrator Chat */}
-      {selectedTeam && (
-        <OrchestratorChat teamId={selectedTeam.id} teamName={selectedTeam.name} />
-      )}
     </div>
   );
 }

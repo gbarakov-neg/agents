@@ -1,0 +1,155 @@
+import { useEffect, useRef, useState } from 'react';
+import { io } from 'socket.io-client';
+import type { Message } from '../types';
+import MessageThread from './MessageThread';
+
+const API = 'http://localhost:3001';
+const socket = io(API);
+
+export default function CommandCenter({
+  teamId, teamName, teamAgentCount,
+}: { teamId: string; teamName: string; teamAgentCount: number }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [streaming, setStreaming] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // If the user has scrolled up to read, don't yank them back on new msgs.
+  const stickToBottomRef = useRef(true);
+
+  useEffect(() => {
+    fetch(`${API}/api/teams/${teamId}/messages`)
+      .then(r => r.json())
+      .then(d => setMessages(d.messages ?? []))
+      .catch(() => {});
+  }, [teamId]);
+
+  useEffect(() => {
+    const onMsg = ({ teamId: tid, message }: { teamId: string; message: Message }) => {
+      if (tid !== teamId) return;
+      setMessages(prev => {
+        if (prev.some(m => m.id === message.id)) {
+          return prev.map(m => m.id === message.id ? message : m);
+        }
+        return [...prev, message];
+      });
+    };
+    socket.on('chat:message', onMsg);
+    return () => { socket.off('chat:message', onMsg); };
+  }, [teamId]);
+
+  // Auto-scroll the inner thread container (not the page) when new messages
+  // arrive, but only if the user is already pinned near the bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (stickToBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // Within 40px of the bottom counts as "at bottom" — covers fractional
+    // pixels and small padding differences.
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  const send = async () => {
+    const content = input.trim();
+    if (!content || streaming) return;
+    setInput('');
+    setStreaming(true);
+    try {
+      const res = await fetch(`${API}/api/teams/${teamId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      });
+      const reader = res.body?.getReader();
+      if (reader) {
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+          // We rely on the socket 'chat:message' events for canonical state;
+          // SSE chunks are only used to show "streaming..." indicator.
+        }
+      }
+    } finally {
+      setStreaming(false);
+    }
+  };
+
+  const approve = async (planMessageId: string, itemIds: string[]) => {
+    const res = await fetch(`${API}/api/teams/${teamId}/messages/${planMessageId}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemIds }),
+    });
+    if (!res.ok) throw new Error(`approve failed: ${res.status}`);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  };
+
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="px-5 py-3 border-b border-gray-700 flex items-center justify-between bg-gray-800/80">
+        <div className="flex items-center gap-2">
+          <h2 className="text-lg font-bold">Command Center</h2>
+          <span className="text-xs text-gray-500">{teamName}</span>
+          {streaming && (
+            <span className="flex items-center gap-1.5 text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full font-medium">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+              orchestrator thinking…
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="p-5">
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="max-h-96 overflow-y-auto mb-3 p-3 bg-gray-900/50 rounded-lg border border-gray-700"
+        >
+          {messages.length === 0 ? (
+            <p className="text-xs text-gray-500 text-center py-4">
+              {teamAgentCount === 0
+                ? "New team — tell the orchestrator what you're building and it'll help you pick agents."
+                : "Tell the orchestrator what you want. It'll reply, or propose a plan you can approve."}
+            </p>
+          ) : (
+            <MessageThread messages={messages} onApprove={approve} />
+          )}
+          {streaming && (
+            <div className="flex justify-start mt-2" aria-label="Orchestrator is thinking">
+              <div className="bg-gray-700/80 text-gray-200 rounded-lg px-3 py-2 flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '0ms' }} />
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '180ms' }} />
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '360ms' }} />
+              </div>
+            </div>
+          )}
+        </div>
+        <textarea
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder="Ask or tell the orchestrator..."
+          rows={3}
+          disabled={streaming}
+          className="w-full bg-gray-700/60 border border-gray-600 rounded-lg px-4 py-3 text-sm resize-none focus:border-blue-500 focus:outline-none placeholder-gray-500 disabled:opacity-50"
+        />
+        <div className="flex items-center justify-between mt-2">
+          <span className="text-[10px] text-gray-600">Enter to send · Shift+Enter for newline</span>
+          <button
+            onClick={send}
+            disabled={!input.trim() || streaming}
+            className="text-sm rounded-lg px-5 py-1.5 font-medium bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white"
+          >
+            {streaming ? 'Streaming...' : 'Send'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

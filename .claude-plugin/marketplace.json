@@ -13,7 +13,7 @@
     {
       "name": "documentation-standards",
       "source": "./plugins/documentation-standards",
-      "description": "HADS (Human-AI Document Standard) — semantic tagging convention for writing docs that work efficiently for both humans and AI models. Reduces token consumption by separating machine-critical facts from human context.",
+      "description": "HADS (Human-AI Document Standard) \u2014 semantic tagging convention for writing docs that work efficiently for both humans and AI models. Reduces token consumption by separating machine-critical facts from human context.",
       "version": "1.0.0",
       "author": {
         "name": "Niksa Barlovic",
@@ -990,7 +990,7 @@
         "url": "https://github.com/major7apps/pensyve.git",
         "path": "integrations/claude-code"
       },
-      "description": "Universal memory runtime — cross-session cognitive memory for Claude Code with episodic, semantic, and procedural memory",
+      "description": "Universal memory runtime \u2014 cross-session cognitive memory for Claude Code with episodic, semantic, and procedural memory",
       "version": "1.0.4",
       "author": {
         "name": "Seth Hobson",
@@ -1011,6 +1011,26 @@
       "homepage": "https://github.com/cskwork",
       "license": "MIT",
       "category": "security"
+    },
+    {
+      "name": "product-owner",
+      "source": "./plugins/product-owner",
+      "description": "Professional Product Owner agent for website/app roasting, user story crafting, MVP scoping, PRD writing, and unconventional growth recommendations. Combines PO discipline with top 0.1% entrepreneur thinking.",
+      "version": "1.0.0",
+      "agents": [
+        "./agents/product-owner.md"
+      ],
+      "skills": [
+        "./skills/product-roast",
+        "./skills/user-story-craft",
+        "./skills/mvp-scoping"
+      ],
+      "commands": [
+        "./commands/roast.md",
+        "./commands/user-stories.md",
+        "./commands/mvp-scope.md",
+        "./commands/prd.md"
+      ]
     }
   ]
 }

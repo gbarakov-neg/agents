@@ -10,8 +10,10 @@ export interface Project {
   id: string;
   name: string;
   path: string;
+  url?: string;
   description?: string;
   createdAt: string;
+  docRef?: string;
 }
 
 export interface Instruction {
@@ -19,7 +21,7 @@ export interface Instruction {
   teamId: string;
   projectId?: string;
   content: string;
-  status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed';
+  status: 'pending' | 'acknowledged' | 'executing' | 'clarifying' | 'done' | 'failed';
   createdAt: string;
   acknowledgedAt?: string;
 }
@@ -47,6 +49,8 @@ export interface Team {
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+  orchestratorProvider?: 'claude' | 'openai';
+  orchestratorModel?: string;
 }
 
 export interface WorkflowPhase {
@@ -84,3 +88,31 @@ export interface AgentResult {
   startedAt: string;
   completedAt: string;
 }
+
+export type Priority = 'high' | 'medium' | 'low';
+
+export type PlanItemKind = 'work' | 'add_agent';
+
+export interface PlanProposalItem {
+  id: string;
+  title: string;
+  detail?: string;
+  priority: Priority;
+  suggestedAgent?: string;
+  kind?: PlanItemKind;
+}
+
+export type ExecutionStatusCode = 'started' | 'progress' | 'completed' | 'failed';
+export type Approval = 'pending' | 'approved' | 'declined';
+
+export type Message =
+  | { id: string; role: 'user' | 'assistant'; kind: 'text';
+      content: string; createdAt: string }
+  | { id: string; role: 'assistant'; kind: 'plan_proposal';
+      summary: string; items: PlanProposalItem[];
+      approval: Approval; approvedItemIds?: string[];
+      createdAt: string }
+  | { id: string; role: 'system'; kind: 'execution_status';
+      planMessageId: string; phase: string;
+      agentId?: string; status: ExecutionStatusCode;
+      detail?: string; createdAt: string };

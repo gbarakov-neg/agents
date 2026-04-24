@@ -22,3 +22,11 @@ venv
 node_modules
 .sass-cache
 .claude
+
+# Git worktrees
+.worktrees/
+
+# Secrets (never commit)
+.env
+.env.local
+.env.*.local

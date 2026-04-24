@@ -5,10 +5,22 @@ import { spawn, ChildProcess } from 'child_process';
 import { readdir, readFile, writeFile, stat, mkdir } from 'fs/promises';
 import { join, basename, dirname } from 'path';
 import { existsSync } from 'fs';
+import { homedir } from 'os';
+import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { initNotion } from './notion.js';
+import { defaultProvider, defaultModelFor, resolveProvider } from './src/providers/factory';
+import { MessageStore } from './src/messages/store';
+import { createMessagesRouter } from './src/messages/router';
+import { createExecutionAdapter } from './src/messages/executionAdapter';
+import type { Message } from './src/messages/types';
+import { resolveProjectDoc } from './src/docs/factory';
 
 dotenv.config();
+
+// Initialize Notion if configured
+initNotion(process.env.NOTION_TOKEN, process.env.NOTION_DATABASE_ID);
 
 const app = express();
 const httpServer = createServer(app);
@@ -41,8 +53,10 @@ interface Project {
   id: string;
   name: string;
   path: string;
+  url?: string;
   description?: string;
   createdAt: string;
+  docRef?: string;
 }
 
 interface Instruction {
@@ -50,9 +64,21 @@ interface Instruction {
   teamId: string;
   projectId?: string;
   content: string;
-  status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed';
+  status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed' | 'clarifying';
   createdAt: string;
   acknowledgedAt?: string;
+  docTicketRef?: string;
+  clarifyingQuestions?: string;
+}
+
+interface AgentReport {
+  agentName: string;
+  role: string;
+  task: string;
+  status: string;
+  reasoning: string;
+  filesChanged: string[];
+  summary: string;
 }
 
 interface AgentResult {
@@ -63,6 +89,7 @@ interface AgentResult {
   exitCode: number | null;
   startedAt: string;
   completedAt: string;
+  report?: AgentReport;
 }
 
 interface Agent {
@@ -88,6 +115,8 @@ interface Team {
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+  orchestratorProvider?: 'claude' | 'openai';
+  orchestratorModel?: string;
 }
 
 interface WorkflowPhase {
@@ -109,12 +138,6 @@ interface LogEntry {
   message: string;
 }
 
-interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: string;
-}
-
 const availableAgents: AvailableAgent[] = [];
 const projectsState = new Map<string, Project>();
 const instructionsState: Instruction[] = [];
@@ -124,6 +147,12 @@ const logsState: LogEntry[] = [];
 const resultsState: AgentResult[] = [];
 const runningProcesses = new Map<string, ChildProcess>();
 
+const messageStore = new MessageStore();
+const executionAdapter = createExecutionAdapter({
+  store: messageStore,
+  emit: (event, payload) => io.emit(event, payload),
+});
+
 // ============================================================
 // PERSISTENCE
 // ============================================================
@@ -131,12 +160,16 @@ const runningProcesses = new Map<string, ChildProcess>();
 const DATA_DIR = join(process.cwd(), 'data');
 const STATE_FILE = join(DATA_DIR, 'state.json');
 
+const projectDoc = resolveProjectDoc({
+  localRootDir: join(DATA_DIR, 'projects'),
+});
+
 interface PersistedState {
   projects: Project[];
   teams: Team[];
   instructions: Instruction[];
   results: AgentResult[];
-  chatHistories?: Record<string, ChatMessage[]>;
+  messages?: Record<string, Message[]>;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -159,18 +192,12 @@ async function saveState() {
     }))
   }));
 
-  // Persist chat histories (last 20 messages per team)
-  const chats: Record<string, ChatMessage[]> = {};
-  for (const [teamId, msgs] of chatHistories) {
-    chats[teamId] = msgs.slice(-20);
-  }
-
   const data: PersistedState = {
     projects: Array.from(projectsState.values()),
     teams,
     instructions: instructionsState,
     results: resultsState.slice(-100),
-    chatHistories: chats,
+    messages: messageStore.snapshot(),
   };
 
   if (!existsSync(DATA_DIR)) await mkdir(DATA_DIR, { recursive: true });
@@ -195,7 +222,15 @@ async function loadState() {
       }
       teamsState.set(t.id, t);
     }
-    instructionsState.push(...(data.instructions || []));
+    for (const instr of (data.instructions || [])) {
+      // Migrate legacy Instruction.notionPageId -> docTicketRef at load time.
+      const legacy = instr as unknown as { notionPageId?: string; docTicketRef?: string };
+      if (legacy.notionPageId && !legacy.docTicketRef) {
+        legacy.docTicketRef = legacy.notionPageId;
+        delete legacy.notionPageId;
+      }
+      instructionsState.push(instr);
+    }
     // Reset any executing instructions to pending (agents were killed on restart)
     for (const instr of instructionsState) {
       if (instr.status === 'executing' || instr.status === 'pending') {
@@ -204,12 +239,7 @@ async function loadState() {
     }
     resultsState.push(...(data.results || []));
 
-    // Load chat histories
-    if (data.chatHistories) {
-      for (const [teamId, msgs] of Object.entries(data.chatHistories)) {
-        chatHistories.set(teamId, msgs);
-      }
-    }
+    if (data.messages) messageStore.loadSnapshot(data.messages);
 
     console.log(`Loaded state: ${projectsState.size} projects, ${teamsState.size} teams, ${instructionsState.length} instructions`);
   } catch (err) {
@@ -225,7 +255,8 @@ io.emit = ((event: string, ...args: unknown[]) => {
     event.startsWith('team:') ||
     event.startsWith('project:') ||
     event.startsWith('instruction:') ||
-    event === 'agent:updated'
+    event === 'agent:updated' ||
+    event === 'chat:message'
   )) {
     scheduleSave();
   }
@@ -472,116 +503,6 @@ interface OrchestratorPlan {
   }[];
 }
 
-// Analyze task and compose the right team from the plugin catalog
-async function composeTeam(team: Team, instruction: string, projectPath: string): Promise<void> {
-  // Build a condensed catalog of available agents (grouped by plugin, top 60 to fit in context)
-  const catalog = availableAgents
-    .map(a => `${a.name} (${a.plugin}): ${a.description.substring(0, 80)}`)
-    .join('\n');
-
-  const currentRoles = team.agents.map(a => a.role);
-  const currentList = currentRoles.length > 0
-    ? `Current team members: ${currentRoles.join(', ')}`
-    : 'Current team: empty';
-
-  const prompt = `You are a team composition expert. Given a task and a catalog of available agents, decide which agents are needed.
-
-Task: ${instruction}
-
-${currentList}
-
-Available agents catalog:
-${catalog}
-
-Respond with ONLY valid JSON (no markdown, no backticks):
-{
-  "add": [{"name": "agent-name-from-catalog", "reason": "why needed"}],
-  "remove": [{"name": "current-role-to-remove", "reason": "why not needed"}],
-  "keep": ["current-role-to-keep"]
-}
-
-Rules:
-- Add agents that are essential for the task but missing from the team
-- Remove agents that are clearly irrelevant to this specific task
-- Keep agents that are useful
-- Be selective: 3-6 agents total is ideal, don't add more than needed
-- Use exact agent names from the catalog`;
-
-  return new Promise((resolve) => {
-    const proc = spawn('claude', ['--print', '--model', 'haiku'], {
-      cwd: projectPath,
-      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-composer' },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    proc.stdin?.write(prompt);
-    proc.stdin?.end();
-
-    let out = '';
-    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    proc.stderr?.on('data', (_d: Buffer) => { /* ignore stderr */ });
-
-    proc.on('close', () => {
-      try {
-        const jsonMatch = out.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) { resolve(); return; }
-
-        const composition = JSON.parse(jsonMatch[0]) as {
-          add?: { name: string; reason: string }[];
-          remove?: { name: string; reason: string }[];
-          keep?: string[];
-        };
-
-        // Add recommended agents
-        if (composition.add) {
-          for (const rec of composition.add) {
-            // Skip if already on team
-            if (team.agents.some(a => a.role === rec.name)) continue;
-
-            const catalogEntry = availableAgents.find(a => a.name === rec.name);
-            if (!catalogEntry) continue;
-
-            const model = catalogEntry.model === 'opus' ? 'claude-opus-4-6'
-              : catalogEntry.model === 'haiku' ? 'claude-haiku-4-5-20251001'
-              : 'claude-sonnet-4-6';
-
-            const displayName = rec.name.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-            const newAgent: Agent = {
-              id: `agent-${Math.random().toString(36).substring(2, 11)}`,
-              name: displayName,
-              role: rec.name,
-              status: 'idle',
-              progress: 0,
-              model,
-              plugin: catalogEntry.plugin
-            };
-            team.agents.push(newAgent);
-            addLog(team.id, newAgent.id, 'info', `Orchestrator auto-added ${displayName} (${catalogEntry.plugin}): ${rec.reason}`);
-          }
-        }
-
-        // Remove irrelevant agents (only idle ones, don't kill working agents)
-        if (composition.remove) {
-          for (const rec of composition.remove) {
-            const idx = team.agents.findIndex(a => a.role === rec.name && a.status === 'idle');
-            if (idx >= 0) {
-              const removed = team.agents.splice(idx, 1)[0];
-              addLog(team.id, undefined, 'info', `Orchestrator removed ${removed.name}: ${rec.reason}`);
-            }
-          }
-        }
-
-        io.emit('team:updated', team);
-      } catch { /* ignore parse errors, keep team as-is */ }
-      resolve();
-    });
-
-    proc.on('error', () => resolve());
-
-    // Timeout after 30s
-    setTimeout(() => { try { proc.kill(); } catch {} resolve(); }, 30000);
-  });
-}
-
 // Run Claude to create an execution plan
 async function createPlan(team: Team, instruction: string, projectPath: string): Promise<OrchestratorPlan> {
   const agentList = team.agents.map(a => `- ${a.name} (role: ${a.role})`).join('\n');
@@ -701,21 +622,186 @@ function executePhase(
   });
 }
 
-// Main orchestration: plan → execute phases sequentially
-async function orchestrateTeam(team: Team, instruction: string) {
-  const project = team.projectId ? projectsState.get(team.projectId) : undefined;
-  if (!project) {
-    addLog(team.id, undefined, 'error', 'Cannot execute: no project assigned or project not found');
-    return;
+// Generate a structured report for an agent's work
+async function generateAgentReport(agent: Agent, task: string, projectPath: string): Promise<AgentReport> {
+  const prompt = `Summarize what this agent did, in 2-3 sentences. Be specific about changes made.
+
+Agent: ${agent.name} (${agent.role})
+Task: ${task}
+Status: ${agent.status}
+Files changed: ${(agent.filesChanged || []).join(', ') || 'none'}
+Output (first 1500 chars): ${(agent.output || '').substring(0, 1500)}
+
+Respond with ONLY valid JSON:
+{"summary":"what was done","reasoning":"why these changes were made"}`;
+
+  return new Promise((resolve) => {
+    const proc = spawn('claude', ['--print', '--model', 'haiku'], {
+      cwd: projectPath,
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-report' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    proc.stdin?.write(prompt);
+    proc.stdin?.end();
+
+    let out = '';
+    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    proc.stderr?.on('data', () => {});
+
+    proc.on('close', () => {
+      try {
+        const match = out.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          resolve({
+            agentName: agent.name,
+            role: agent.role,
+            task,
+            status: agent.status,
+            reasoning: parsed.reasoning || 'No reasoning provided',
+            filesChanged: agent.filesChanged || [],
+            summary: parsed.summary || 'No summary available'
+          });
+          return;
+        }
+      } catch {}
+      resolve({
+        agentName: agent.name,
+        role: agent.role,
+        task,
+        status: agent.status,
+        reasoning: 'Report generation failed',
+        filesChanged: agent.filesChanged || [],
+        summary: agent.output?.substring(0, 200) || 'No output'
+      });
+    });
+    proc.on('error', () => {
+      resolve({
+        agentName: agent.name, role: agent.role, task, status: agent.status,
+        reasoning: 'Error generating report', filesChanged: agent.filesChanged || [],
+        summary: 'Error'
+      });
+    });
+    setTimeout(() => { try { proc.kill(); } catch {} }, 15000);
+  });
+}
+
+async function dispatchAgentAdds(teamId: string, planMessageId: string, itemIds: string[]) {
+  const team = teamsState.get(teamId);
+  if (!team) return;
+  const planMsg = messageStore.findById(teamId, planMessageId);
+  if (!planMsg || planMsg.kind !== 'plan_proposal') return;
+
+  const approved = planMsg.items.filter(i => itemIds.includes(i.id));
+  const added: { role: string; rationale: string }[] = [];
+  const skippedUnknown: string[] = [];
+  const skippedDup: string[] = [];
+
+  for (const item of approved) {
+    const role = item.title;
+    const catalog = availableAgents.find(a => a.name === role);
+    if (!catalog) { skippedUnknown.push(role); continue; }
+    if (team.agents.some(a => a.role === role)) { skippedDup.push(role); continue; }
+
+    const displayName = role.split('-')
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    const modelChoice = catalog.model && catalog.model !== 'inherit'
+      ? catalog.model
+      : (team.orchestratorModel || 'sonnet');
+    const newAgent: Agent = {
+      id: `agent-${Math.random().toString(36).slice(2, 11)}`,
+      name: displayName,
+      role,
+      status: 'idle',
+      progress: 0,
+      model: modelChoice,
+      plugin: catalog.plugin,
+    };
+    team.agents.push(newAgent);
+    added.push({ role, rationale: item.detail ?? '' });
   }
 
-  // Phase 0: Team Composition
-  team.phase = 'composing';
   io.emit('team:updated', team);
-  addLog(team.id, undefined, 'info', `Orchestrator: analyzing task and composing team (${availableAgents.length} agents in catalog)...`);
 
-  await composeTeam(team, instruction, project.path);
-  addLog(team.id, undefined, 'info', `Orchestrator: team composed — ${team.agents.length} agent(s): ${team.agents.map(a => a.name).join(', ')}`);
+  // Emit an execution_status row describing the effect (shown inline in the thread).
+  const detailParts: string[] = [];
+  if (added.length) detailParts.push(`Added: ${added.map(a => a.role).join(', ')}`);
+  if (skippedUnknown.length) detailParts.push(`Skipped (unknown role): ${skippedUnknown.join(', ')}`);
+  if (skippedDup.length) detailParts.push(`Skipped (already on team): ${skippedDup.join(', ')}`);
+  executionAdapter.emitEvent(teamId, planMessageId, {
+    phase: 'team',
+    status: added.length > 0 ? 'completed' : 'failed',
+    detail: detailParts.join(' · ') || 'No changes',
+  });
+
+  // Persist to project doc if the team has a project
+  if (team.projectId && added.length > 0) {
+    try {
+      await projectDoc.appendTeamComposition(team.projectId, added);
+    } catch (err) {
+      console.warn('[projectDoc] appendTeamComposition failed:', (err as Error).message);
+    }
+  }
+}
+
+async function dispatchApprovedPlan(teamId: string, planMessageId: string, itemIds: string[]) {
+  const team = teamsState.get(teamId);
+  if (!team || !team.projectId) return;
+  const project = projectsState.get(team.projectId);
+  if (!project) return;
+
+  const planMsg = messageStore.findById(teamId, planMessageId);
+  if (!planMsg || planMsg.kind !== 'plan_proposal') return;
+
+  const selected = planMsg.items.filter(i => itemIds.includes(i.id));
+  const instructionText = [
+    planMsg.summary,
+    ...selected.map(i => `- ${i.title}${i.detail ? `: ${i.detail}` : ''}`),
+  ].join('\n');
+
+  const instr: Instruction = {
+    id: `instr-${Math.random().toString(36).slice(2, 11)}`,
+    teamId,
+    projectId: team.projectId,
+    content: instructionText,
+    status: 'executing',
+    createdAt: new Date().toISOString(),
+  };
+  instructionsState.push(instr);
+  io.emit('instruction:updated', instr);
+
+  executionAdapter.emitEvent(teamId, planMessageId, { phase: 'planning', status: 'started' });
+
+  try {
+    await executePlanAndPhases(team, instructionText, project, instr, planMessageId);
+    executionAdapter.emitEvent(teamId, planMessageId, { phase: 'complete', status: 'completed' });
+  } catch (err) {
+    executionAdapter.emitEvent(teamId, planMessageId, {
+      phase: 'complete', status: 'failed', detail: (err as Error).message,
+    });
+  }
+}
+
+// Core planning + phased execution logic
+async function executePlanAndPhases(
+  team: Team, instruction: string, project: Project,
+  instructionObj?: Instruction, planMessageId?: string
+) {
+
+  // Create project doc task entry
+  let docTicketRef: string | undefined;
+  try {
+    const result = await projectDoc.appendTask(project.id, {
+      title: instruction.substring(0, 100),
+      items: [instruction],
+      agents: team.agents.map(a => a.name),
+    });
+    docTicketRef = result.ticketRef;
+    if (docTicketRef && instructionObj) instructionObj.docTicketRef = docTicketRef;
+    if (docTicketRef) addLog(team.id, undefined, 'info', 'Project doc: task entry created');
+  } catch (err) {
+    console.warn('[projectDoc] appendTask failed:', (err as Error).message);
+  }
 
   // Phase 1: Planning
   team.phase = 'planning';
@@ -743,6 +829,9 @@ async function orchestrateTeam(team: Team, instruction: string) {
     team.phase = phase.name.toLowerCase();
     phases[i].status = 'in-progress';
     phases[i].startTime = new Date().toISOString();
+    if (planMessageId) executionAdapter.emitEvent(team.id, planMessageId, {
+      phase: phase.name, status: 'started',
+    });
     io.emit('team:updated', team);
     io.emit('phase:updated', { teamId: team.id, phase: phases[i], index: i });
 
@@ -751,10 +840,73 @@ async function orchestrateTeam(team: Team, instruction: string) {
     const phaseOutput = await executePhase(team, phase, project.path, priorContext);
     priorContext += phaseOutput;
 
+    // Generate reports for agents that completed in this phase
+    for (const agent of team.agents.filter(a => phase.agentRoles.includes(a.role) && (a.status === 'complete' || a.status === 'failed'))) {
+      const task = phase.tasks[agent.role] || instruction;
+      const report = await generateAgentReport(agent, task, project.path);
+
+      // Store report in result
+      const result = resultsState.find(r => r.agentId === agent.id && r.teamId === team.id);
+      if (result) result.report = report;
+
+      addLog(team.id, agent.id, 'info', `Report: ${report.summary}`);
+
+      // Push to project doc
+      try {
+        await projectDoc.appendAgentReport(project.id, docTicketRef, {
+          agentName: report.agentName,
+          role: report.role,
+          task: report.task,
+          status: report.status,
+          output: agent.output,
+          filesChanged: report.filesChanged,
+          reasoning: report.reasoning,
+          summary: report.summary,
+        });
+      } catch (err) {
+        console.warn('[projectDoc] appendAgentReport failed:', (err as Error).message);
+      }
+
+      // Emit report to frontend
+      io.emit('agent:report', { teamId: team.id, agentId: agent.id, report });
+    }
+
     phases[i].status = 'complete';
     phases[i].endTime = new Date().toISOString();
+    if (planMessageId) executionAdapter.emitEvent(team.id, planMessageId, {
+      phase: phase.name, status: 'completed',
+    });
     io.emit('phase:updated', { teamId: team.id, phase: phases[i], index: i });
     addLog(team.id, undefined, 'info', `Orchestrator: phase "${phase.name}" complete`);
+  }
+
+  // Update project doc task status
+  try {
+    const anyFailed = team.agents.some(a => a.status === 'failed');
+    await projectDoc.updateTaskStatus(project.id, docTicketRef, anyFailed ? 'Failed' : 'Done');
+    addLog(team.id, undefined, 'info', `Project doc: task marked ${anyFailed ? 'Failed' : 'Done'}`);
+  } catch (err) {
+    console.warn('[projectDoc] updateTaskStatus failed:', (err as Error).message);
+  }
+
+  // Post summary to chat
+  const completedAgents = team.agents.filter(a => a.status === 'complete');
+  const failedAgents = team.agents.filter(a => a.status === 'failed');
+  const allResults = resultsState.filter(r => r.teamId === team.id && r.report);
+  const chatSummary = `## Task Complete\n\n${completedAgents.length} agent(s) succeeded, ${failedAgents.length} failed.\n\n` +
+    allResults.slice(-team.agents.length).map(r => r.report ? `**${r.report.agentName}**: ${r.report.summary}` : '').filter(Boolean).join('\n\n') +
+    (docTicketRef ? '\n\n📋 Notion ticket has been updated with full reports.' : '');
+
+  {
+    const msg = {
+      id: randomUUID(),
+      role: 'assistant' as const,
+      kind: 'text' as const,
+      content: chatSummary,
+      createdAt: new Date().toISOString(),
+    };
+    messageStore.append(team.id, msg);
+    io.emit('chat:message', { teamId: team.id, message: msg });
   }
 
   addLog(team.id, undefined, 'info', 'Orchestrator: all phases complete');
@@ -830,7 +982,10 @@ app.post('/api/teams', (req, res) => {
       plugin: agent.plugin
     })),
     createdAt: new Date().toISOString(),
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    orchestratorProvider: req.body.orchestratorProvider ?? defaultProvider(),
+    orchestratorModel: req.body.orchestratorModel
+      ?? defaultModelFor(req.body.orchestratorProvider ?? defaultProvider()),
   };
 
   teamsState.set(teamId, newTeam);
@@ -838,22 +993,17 @@ app.post('/api/teams', (req, res) => {
 
   io.emit('team:created', newTeam);
 
-  // If initial instructions, dispatch immediately
+  // If initial instructions, store as the first user message in the thread
   if (instructions && typeof instructions === 'string' && instructions.trim()) {
-    const instr: Instruction = {
-      id: `instr-${Date.now()}`,
-      teamId,
-      projectId: projectId || undefined,
+    const userMsg = {
+      id: randomUUID(),
+      role: 'user' as const,
+      kind: 'text' as const,
       content: instructions.trim(),
-      status: 'executing',
       createdAt: new Date().toISOString(),
-      acknowledgedAt: new Date().toISOString()
     };
-    instructionsState.push(instr);
-    io.emit('instruction:created', instr);
-
-    // Orchestrate agents
-    setTimeout(() => orchestrateTeam(newTeam, instructions.trim()), 500);
+    messageStore.append(newTeam.id, userMsg);
+    io.emit('chat:message', { teamId: newTeam.id, message: userMsg });
   }
 
   res.json(newTeam);
@@ -965,6 +1115,87 @@ app.post('/api/teams/:teamId/shutdown', (req, res) => {
   res.json(team);
 });
 
+app.delete('/api/teams/:teamId', (req, res) => {
+  const teamId = req.params.teamId;
+  const team = teamsState.get(teamId);
+  if (!team) return res.status(404).json({ error: 'Team not found' });
+
+  // Kill running agent processes before removing state
+  for (const agent of team.agents) {
+    const proc = runningProcesses.get(agent.id);
+    if (proc) { try { proc.kill(); } catch {} }
+    runningProcesses.delete(agent.id);
+  }
+
+  teamsState.delete(teamId);
+  phasesState.delete(teamId);
+  messageStore.loadSnapshot(
+    Object.fromEntries(
+      Object.entries(messageStore.snapshot()).filter(([k]) => k !== teamId),
+    ),
+  );
+
+  io.emit('team:deleted', { teamId });
+  res.json({ ok: true });
+});
+
+// ============================================================
+// MESSAGES ROUTER
+// ============================================================
+
+app.use('/api/teams/:teamId/messages', createMessagesRouter({
+  store: messageStore,
+  getTeam: (teamId) => {
+    const t = teamsState.get(teamId);
+    if (!t) return undefined;
+    return {
+      ...t,
+      orchestratorProvider: t.orchestratorProvider ?? defaultProvider(),
+      orchestratorModel: t.orchestratorModel
+        ?? defaultModelFor(t.orchestratorProvider ?? defaultProvider()),
+    };
+  },
+  getProject: (teamId) => {
+    const t = teamsState.get(teamId);
+    if (!t?.projectId) return undefined;
+    return projectsState.get(t.projectId);
+  },
+  getAvailableAgents: () => availableAgents,
+  getProvider: (team, project) => resolveProvider(
+    { orchestratorProvider: team.orchestratorProvider, orchestratorModel: team.orchestratorModel },
+    { projectPath: project.path },
+  ),
+  onApproved: (teamId, planMessageId, itemIds) => {
+    const msg = messageStore.findById(teamId, planMessageId);
+    if (!msg || msg.kind !== 'plan_proposal') return;
+    const approvedItems = msg.items.filter(i => itemIds.includes(i.id));
+    const kind = approvedItems[0]?.kind ?? 'work';
+    if (kind === 'add_agent') {
+      dispatchAgentAdds(teamId, planMessageId, itemIds)
+        .catch(err => console.error('dispatch agents failed', err));
+    } else {
+      dispatchApprovedPlan(teamId, planMessageId, itemIds)
+        .catch(err => console.error('dispatch plan failed', err));
+    }
+  },
+  emit: (event, payload) => {
+    io.emit(event, payload);
+    if (event === 'chat:message') {
+      const p = payload as { teamId: string; message: { role: string; kind: string; content?: string } };
+      const team = teamsState.get(p.teamId);
+      if (
+        team && team.projectId &&
+        team.agents.length === 0 &&
+        p.message.role === 'user' && p.message.kind === 'text' &&
+        typeof p.message.content === 'string' && p.message.content.trim().length > 0
+      ) {
+        projectDoc.appendBrief(team.projectId, p.message.content).catch(err =>
+          console.warn('[projectDoc] appendBrief failed:', (err as Error).message));
+      }
+    }
+  },
+}));
+
 // ============================================================
 // PROJECTS
 // ============================================================
@@ -973,18 +1204,106 @@ app.get('/api/projects', (_req, res) => {
   res.json({ projects: Array.from(projectsState.values()) });
 });
 
-app.post('/api/projects', (req, res) => {
-  const { name, path, description } = req.body;
+function slugify(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
+}
+
+app.post('/api/projects', async (req, res) => {
+  const { name, path: rawPath, url, description } = req.body ?? {};
+  if (typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+
+  let resolvedPath = typeof rawPath === 'string' ? rawPath.trim() : '';
+  if (!resolvedPath) {
+    resolvedPath = join(homedir(), 'claude-projects', slugify(name.trim()));
+  }
+
+  try {
+    if (!existsSync(resolvedPath)) await mkdir(resolvedPath, { recursive: true });
+  } catch (err) {
+    return res.status(400).json({ error: `failed to create project directory: ${(err as Error).message}` });
+  }
+
   const id = `proj-${Date.now()}`;
-  const project: Project = { id, name, path, description, createdAt: new Date().toISOString() };
+  const project: Project = {
+    id,
+    name: name.trim(),
+    path: resolvedPath,
+    url,
+    description,
+    createdAt: new Date().toISOString(),
+  };
   projectsState.set(id, project);
   io.emit('project:created', project);
+
+  try {
+    await projectDoc.createProject({
+      projectId: id, name: project.name, path: project.path,
+      url: project.url, description: project.description,
+    });
+    project.docRef = `data/projects/${id}`; // purely informational for the frontend
+  } catch (err) {
+    console.warn('[projectDoc] createProject failed:', (err as Error).message);
+  }
+
+  // Auto-create an empty default team for the new project so the user can
+  // start chatting with the orchestrator immediately. Only do this if no
+  // team is already attached to this project (a fresh project never has
+  // one, but keep the guard for safety).
+  const hasTeam = Array.from(teamsState.values()).some(t => t.projectId === id);
+  if (!hasTeam) {
+    const teamId = `team-${Date.now()}`;
+    const defProvider = defaultProvider();
+    const newTeam: Team = {
+      id: teamId,
+      name: project.name,
+      phase: 'planning',
+      status: 'planning',
+      agents: [],
+      projectId: id,
+      createdAt: new Date().toISOString(),
+      orchestratorProvider: defProvider,
+      orchestratorModel: defaultModelFor(defProvider),
+    };
+    teamsState.set(teamId, newTeam);
+    io.emit('team:created', newTeam);
+  }
+
   res.json(project);
 });
 
-app.delete('/api/projects/:projectId', (req, res) => {
-  projectsState.delete(req.params.projectId);
-  io.emit('project:deleted', { projectId: req.params.projectId });
+app.patch('/api/projects/:projectId', (req, res) => {
+  const project = projectsState.get(req.params.projectId);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const { name, path, url, description } = req.body;
+  if (name !== undefined) project.name = name;
+  if (path !== undefined) project.path = path;
+  if (url !== undefined) project.url = url;
+  if (description !== undefined) project.description = description;
+  projectsState.set(project.id, project);
+  io.emit('project:updated', project);
+  res.json(project);
+});
+
+app.delete('/api/projects/:projectId', async (req, res) => {
+  const projectId = req.params.projectId;
+  projectsState.delete(projectId);
+  // Unlink any teams that referenced this project so they don't orphan.
+  for (const team of teamsState.values()) {
+    if (team.projectId === projectId) {
+      team.projectId = undefined;
+      io.emit('team:updated', team);
+    }
+  }
+  io.emit('project:deleted', { projectId });
+
+  try {
+    await projectDoc.deleteProject(projectId);
+  } catch (err) {
+    console.warn('[projectDoc] deleteProject failed:', (err as Error).message);
+  }
+
   res.json({ ok: true });
 });
 
@@ -997,53 +1316,23 @@ app.patch('/api/teams/:teamId/project', (req, res) => {
   res.json(team);
 });
 
+app.patch('/api/teams/:teamId', (req, res) => {
+  const team = teamsState.get(req.params.teamId);
+  if (!team) return res.status(404).json({ error: 'Team not found' });
+  const { orchestratorProvider, orchestratorModel } = req.body ?? {};
+  if (orchestratorProvider === 'claude' || orchestratorProvider === 'openai') {
+    team.orchestratorProvider = orchestratorProvider;
+  }
+  if (typeof orchestratorModel === 'string' && orchestratorModel.trim()) {
+    team.orchestratorModel = orchestratorModel.trim();
+  }
+  io.emit('team:updated', team);
+  res.json(team);
+});
+
 // ============================================================
 // INSTRUCTIONS
 // ============================================================
-
-app.get('/api/teams/:teamId/instructions', (req, res) => {
-  const instructions = instructionsState.filter(i => i.teamId === req.params.teamId);
-  res.json({ instructions });
-});
-
-app.post('/api/teams/:teamId/instructions', (req, res) => {
-  const { content, mode, agentId } = req.body;
-  // mode: 'orchestrate' (default) | 'parallel' | 'agent'
-  const teamId = req.params.teamId;
-  const team = teamsState.get(teamId);
-  if (!team) return res.status(404).json({ error: 'Team not found' });
-
-  const instruction: Instruction = {
-    id: `instr-${Date.now()}`,
-    teamId,
-    projectId: team.projectId,
-    content,
-    status: 'executing',
-    createdAt: new Date().toISOString(),
-    acknowledgedAt: new Date().toISOString()
-  };
-  instructionsState.push(instruction);
-
-  addLog(teamId, undefined, 'info', `Instruction received (${mode || 'orchestrate'}): "${content.length > 80 ? content.substring(0, 80) + '...' : content}"`);
-  io.emit('instruction:created', instruction);
-
-  if (agentId) {
-    // Per-agent instruction
-    const agent = team.agents.find(a => a.id === agentId);
-    if (agent) {
-      addLog(teamId, agentId, 'info', `Direct instruction to ${agent.name}: ${content.substring(0, 80)}`);
-      dispatchSingleAgent(team, agent, content);
-    }
-  } else if (mode === 'parallel') {
-    // Simple parallel dispatch
-    dispatchTeamSimple(team, content);
-  } else {
-    // Orchestrated execution (default)
-    orchestrateTeam(team, content);
-  }
-
-  res.json(instruction);
-});
 
 // Per-agent instruction endpoint
 app.post('/api/teams/:teamId/agents/:agentId/instruct', (req, res) => {
@@ -1100,122 +1389,30 @@ app.get('/api/teams/:teamId/agents/:agentId/output', (req, res) => {
   });
 });
 
-// ============================================================
-// ORCHESTRATOR CHAT
-// ============================================================
-
-const chatHistories = new Map<string, ChatMessage[]>();
-
-app.get('/api/teams/:teamId/chat', (req, res) => {
-  const history = chatHistories.get(req.params.teamId) || [];
-  res.json({ messages: history });
+// Notion config endpoint
+app.get('/api/notion/status', (_req, res) => {
+  res.json({ enabled: !!(process.env.NOTION_TOKEN && process.env.NOTION_DATABASE_ID) });
 });
 
-app.post('/api/teams/:teamId/chat', (req, res) => {
-  const { message } = req.body;
-  const teamId = req.params.teamId;
-  const team = teamsState.get(teamId);
-  if (!team) return res.status(404).json({ error: 'Team not found' });
-
-  const project = team.projectId ? projectsState.get(team.projectId) : undefined;
-  if (!project) return res.status(400).json({ error: 'No project assigned' });
-
-  // Store user message
-  if (!chatHistories.has(teamId)) chatHistories.set(teamId, []);
-  const history = chatHistories.get(teamId)!;
-  history.push({ role: 'user', content: message, timestamp: new Date().toISOString() });
-
-  // Build context for the orchestrator
-  const teamInfo = team.agents.map(a => `- ${a.name} (${a.role}): ${a.status}, progress ${a.progress}%${a.currentTask ? `, task: ${a.currentTask}` : ''}`).join('\n');
-  const recentResults = resultsState
-    .filter(r => r.teamId === teamId)
-    .slice(-3)
-    .map(r => `Agent ${r.agentId}: ${r.filesChanged.length} files changed, exit ${r.exitCode}`)
-    .join('\n');
-
-  const conversationContext = history.slice(-10).map(m => `${m.role === 'user' ? 'User' : 'Orchestrator'}: ${m.content}`).join('\n\n');
-
-  const prompt = `You are an orchestrator assistant for a development team. You help the user plan, manage, and direct their agent team.
-
-Project: ${project.name} (${project.path})
-
-Current team:
-${teamInfo || '(no agents)'}
-
-Recent results:
-${recentResults || '(none yet)'}
-
-Available actions you can suggest:
-- Recommend adding/removing agents
-- Suggest what instructions to give
-- Analyze what the team has done so far
-- Answer questions about the project
-- Help plan next steps
-
-IMPORTANT: If the user asks you to actually execute something (make changes, run agents, etc.), tell them what instruction to send via the Instructions panel, or what agent to direct. You are advisory — you plan and suggest, agents execute.
-
-If the user asks you to "wait for instructions" or similar, acknowledge and explain what you've analyzed so far.
-
-Conversation:
-${conversationContext}
-
-Respond concisely and helpfully.`;
-
-  // Stream response via SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  console.log(`[chat] Spawning claude in ${project.path}, prompt length: ${prompt.length}`);
-
-  const proc = spawn('claude', ['--print', '--model', 'sonnet'], {
-    cwd: project.path,
-    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'agent-dashboard-chat' },
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-  proc.stdin?.write(prompt);
-  proc.stdin?.end();
-
-  let fullResponse = '';
-  let stderrOutput = '';
-
-  proc.stdout?.on('data', (data: Buffer) => {
-    const chunk = data.toString();
-    fullResponse += chunk;
-    try {
-      res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
-    } catch { /* client may have disconnected */ }
-  });
-
-  proc.stderr?.on('data', (data: Buffer) => {
-    stderrOutput += data.toString();
-  });
-
-  proc.on('close', (code) => {
-    console.log(`[chat] claude exited with code ${code}, stdout: ${fullResponse.length} bytes, stderr: ${stderrOutput.length} bytes`);
-    if (stderrOutput) console.log(`[chat] stderr: ${stderrOutput.substring(0, 500)}`);
-    // Store assistant response
-    if (fullResponse.trim()) {
-      history.push({ role: 'assistant', content: fullResponse, timestamp: new Date().toISOString() });
-      scheduleSave();
-    }
-    try {
-      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-      res.end();
-    } catch { /* already closed */ }
-  });
-
-  proc.on('error', (err) => {
-    try {
-      res.write(`data: ${JSON.stringify({ chunk: `Error: ${err.message}`, done: true })}\n\n`);
-      res.end();
-    } catch { /* already closed */ }
-  });
-
-  // Timeout after 120s
-  const timeout = setTimeout(() => { try { proc.kill(); } catch {} }, 120000);
-  proc.on('close', () => clearTimeout(timeout));
+app.post('/api/notion/configure', (req, res) => {
+  const { token, databaseId } = req.body;
+  if (!token || !databaseId) return res.status(400).json({ error: 'token and databaseId required' });
+  initNotion(token, databaseId);
+  // Save to .env for persistence
+  const envPath = join(process.cwd(), '.env');
+  const envContent = `NOTION_TOKEN=${token}\nNOTION_DATABASE_ID=${databaseId}\n`;
+  writeFile(envPath, envContent).catch(() => {});
+  res.json({ enabled: true });
 });
+
+// Agent reports endpoint
+app.get('/api/teams/:teamId/reports', (req, res) => {
+  const results = resultsState
+    .filter(r => r.teamId === req.params.teamId && r.report)
+    .map(r => r.report);
+  res.json({ reports: results });
+});
+
 
 // ============================================================
 // METRICS & LOGS
