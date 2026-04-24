@@ -275,7 +275,11 @@ export default function Dashboard() {
               )}
 
               {/* Command Center — unified chat + instructions */}
-              <CommandCenter teamId={selectedTeam.id} teamName={selectedTeam.name} />
+              <CommandCenter
+                teamId={selectedTeam.id}
+                teamName={selectedTeam.name}
+                teamAgentCount={selectedTeam.agents.length}
+              />
 
               <TeamMonitor team={selectedTeam} />
 

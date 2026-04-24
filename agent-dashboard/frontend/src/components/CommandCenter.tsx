@@ -6,7 +6,9 @@ import MessageThread from './MessageThread';
 const API = 'http://localhost:3001';
 const socket = io(API);
 
-export default function CommandCenter({ teamId, teamName }: { teamId: string; teamName: string }) {
+export default function CommandCenter({
+  teamId, teamName, teamAgentCount,
+}: { teamId: string; teamName: string; teamAgentCount: number }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
@@ -111,7 +113,9 @@ export default function CommandCenter({ teamId, teamName }: { teamId: string; te
         >
           {messages.length === 0 ? (
             <p className="text-xs text-gray-500 text-center py-4">
-              Tell the orchestrator what you want. It'll reply, or propose a plan you can approve.
+              {teamAgentCount === 0
+                ? "New team — tell the orchestrator what you're building and it'll help you pick agents."
+                : "Tell the orchestrator what you want. It'll reply, or propose a plan you can approve."}
             </p>
           ) : (
             <MessageThread messages={messages} onApprove={approve} />

@@ -91,12 +91,15 @@ export interface AgentResult {
 
 export type Priority = 'high' | 'medium' | 'low';
 
+export type PlanItemKind = 'work' | 'add_agent';
+
 export interface PlanProposalItem {
   id: string;
   title: string;
   detail?: string;
   priority: Priority;
   suggestedAgent?: string;
+  kind?: PlanItemKind;
 }
 
 export type ExecutionStatusCode = 'started' | 'progress' | 'completed' | 'failed';
