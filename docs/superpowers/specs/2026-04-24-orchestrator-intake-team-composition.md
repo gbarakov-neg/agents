@@ -181,7 +181,7 @@ A **factory** `resolveProjectDoc()` picks the sink at call time based on `isNoti
 
 **Project type:** `Project` gains `docRef?: string` (Notion `pageId`, or the local `data/projects/<id>/` path for symmetry). `Instruction.notionPageId` is renamed to `docTicketRef`.
 
-**Persisted-state migration (small, explicit):** `loadState` in `server.ts` reads each instruction and, if the legacy `notionPageId` field is present and `docTicketRef` is absent, copies it over: `instr.docTicketRef = instr.notionPageId; delete instr.notionPageId`. This is a one-shot rewrite done at load time; no separate migration step. Same pattern is used for `Project.docRef` if any prior field existed (none did in v1, so this is strictly a forward-compat placeholder).
+**Persisted-state migration (small, explicit):** `loadState` in `server.ts` reads each instruction and, if the legacy `notionPageId` field is present and `docTicketRef` is absent, copies it over: `instr.docTicketRef = instr.notionPageId; delete instr.notionPageId`. This is a one-shot rewrite done at load time; no separate migration step. `Project.docRef` is a brand-new field with no predecessor in persisted state, so nothing to copy.
 
 **Environment variables:** unchanged — `NOTION_TOKEN` + `NOTION_DATABASE_ID` still gate Notion. When they're both absent, the factory returns `LocalMarkdownProjectDoc` instead of a no-op.
 
@@ -200,7 +200,7 @@ The frontend needs **no new components**. One small behavioral tweak in `Command
 - **User approves an `add_agent` plan when the team already has agents** → handler is idempotent: if an agent with the same `role` already exists, skip and warn. No duplicates.
 - **Team pre-loaded with agents** (e.g. via `CreateTeamModal` before first chat) → intake mode never fires. Orchestrator is in normal mode from turn one.
 - **Notion disabled mid-session** → any notion call early-returns; no error messages in the thread.
-- **Notion `createProjectPage` fails** → logged; project creation still succeeds; downstream writes that reference the missing `notionPageId` early-return.
+- **Notion `createProjectPage` fails** → logged; project creation still succeeds; downstream writes that reference the missing Notion page id early-return. (This page id lives in the sink's `projectId → pageId` map and is unrelated to the `Instruction.docTicketRef` rename.)
 - **Catalog truncation** → the prompt notes "(N more agents available — narrow your ask if you need a different specialty)". Applies when the relevance filter produces more than the 40-entry hard ceiling.
 - **Local docs** → if a project's local docs directory is deleted externally (e.g. user rm's `data/projects/<id>/`), the next write silently re-creates it; no attempt to detect external deletion.
 - **Project deletion** → `DELETE /api/projects/:id` already unlinks teams. Extend to also call `projectDoc.deleteProject(id)` which deletes the local directory or archives the Notion page (Notion archive, not hard delete).
