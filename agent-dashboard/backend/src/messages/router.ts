@@ -5,7 +5,7 @@ import { MessageStore, AlreadyResolvedError, InvalidItemsError, NotFoundError } 
 import type { Message } from './types';
 import { extractPlanProposal } from './parser';
 import { buildOrchestratorPrompt } from './prompt';
-import type { PromptTeam, PromptProject } from './prompt';
+import type { PromptTeam, PromptProject, PromptAgentEntry } from './prompt';
 
 interface TeamWithProviderConfig extends PromptTeam {
   orchestratorProvider: 'claude' | 'openai';
@@ -16,6 +16,7 @@ export interface MessagesDeps {
   store: MessageStore;
   getTeam: (teamId: string) => TeamWithProviderConfig | undefined;
   getProject: (teamId: string) => PromptProject | undefined;
+  getAvailableAgents: () => PromptAgentEntry[];
   getProvider: (team: TeamWithProviderConfig, project: PromptProject) => OrchestratorProvider;
   onApproved: (teamId: string, planMessageId: string, itemIds: string[]) => void;
   emit: (event: string, payload: unknown) => void;
@@ -50,7 +51,10 @@ export function createMessagesRouter(deps: MessagesDeps): Router {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const prompt = buildOrchestratorPrompt({ team, project, thread: deps.store.get(teamId) });
+    const prompt = buildOrchestratorPrompt({
+      team, project, thread: deps.store.get(teamId),
+      availableAgents: deps.getAvailableAgents(),
+    });
     // Abort the provider only if the response socket is actually destroyed
     // before it ends — not on every req.on('close') (which can fire
     // prematurely behind Vite's dev proxy and kill claude mid-generation).

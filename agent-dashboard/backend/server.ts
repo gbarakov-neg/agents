@@ -1086,6 +1086,7 @@ app.use('/api/teams/:teamId/messages', createMessagesRouter({
     if (!t?.projectId) return undefined;
     return projectsState.get(t.projectId);
   },
+  getAvailableAgents: () => availableAgents,
   getProvider: (team, project) => resolveProvider(
     { orchestratorProvider: team.orchestratorProvider, orchestratorModel: team.orchestratorModel },
     { projectPath: project.path },

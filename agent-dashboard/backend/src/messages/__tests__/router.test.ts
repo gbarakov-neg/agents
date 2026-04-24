@@ -31,6 +31,7 @@ describe('messages router', () => {
       store,
       getTeam: () => team,
       getProject: () => project,
+      getAvailableAgents: () => [],
       getProvider: () => stubProvider('plain text reply'),
       onApproved: () => {},
       emit: () => {},
@@ -65,6 +66,7 @@ describe('messages router', () => {
       store: store2,
       getTeam: () => teamForPlan,
       getProject: () => ({ id: 'p1', name: 'P', path: '/tmp' }),
+      getAvailableAgents: () => [],
       getProvider: () => stubProvider('```json\n' + JSON.stringify({
         kind: 'plan_proposal', summary: 'do it',
         items: [{ id: 'a', title: 'A', priority: 'high' }],
@@ -90,6 +92,7 @@ describe('messages router', () => {
       store,
       getTeam: () => ({ id: 't1', name: 'T', agents: [], orchestratorProvider: 'claude', orchestratorModel: 'sonnet' }),
       getProject: () => ({ id: 'p1', name: 'P', path: '/tmp' }),
+      getAvailableAgents: () => [],
       getProvider: () => stubProvider(''),
       onApproved: (...a) => calls.push(a),
       emit: () => {},
@@ -123,5 +126,34 @@ describe('messages router', () => {
     });
     const r = await request(app).post('/api/teams/t1/messages/p3/approve').send({ itemIds: ['a'] });
     expect(r.status).toBe(409);
+  });
+
+  it('includes catalog in intake-mode prompt via getAvailableAgents', async () => {
+    let capturedPrompt = '';
+    const app2 = express();
+    app2.use(express.json());
+    const store2 = new MessageStore();
+    app2.use('/api/teams/:teamId/messages', createMessagesRouter({
+      store: store2,
+      getTeam: () => ({
+        id: 't1', name: 'T', agents: [],
+        orchestratorProvider: 'claude', orchestratorModel: 'sonnet',
+      }),
+      getProject: () => ({ id: 'p1', name: 'Perfume', path: '/tmp' }),
+      getAvailableAgents: () => [
+        { name: 'perfume-stylist', description: 'designs fragrances' },
+      ],
+      getProvider: () => ({
+        async streamTurn({ prompt, onChunk }) {
+          capturedPrompt = prompt;
+          onChunk('hi');
+          return { fullText: 'hi' };
+        },
+      }),
+      onApproved: () => {},
+      emit: () => {},
+    }));
+    await request(app2).post('/api/teams/t1/messages').send({ content: 'tell me' });
+    expect(capturedPrompt).toContain('perfume-stylist');
   });
 });
