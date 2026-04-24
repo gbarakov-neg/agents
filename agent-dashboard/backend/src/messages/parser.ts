@@ -6,6 +6,7 @@ export interface PlanProposalPayload {
 }
 
 const VALID_PRIORITIES: ReadonlySet<Priority> = new Set(['high', 'medium', 'low']);
+const VALID_KINDS: ReadonlySet<string> = new Set(['work', 'add_agent']);
 
 export function extractPlanProposal(fullText: string): PlanProposalPayload | null {
   const candidates: string[] = [];
@@ -38,6 +39,7 @@ function tryParse(raw: string): PlanProposalPayload | null {
 
   const seen = new Set<string>();
   const items: PlanProposalItem[] = [];
+  let sharedKind: 'work' | 'add_agent' | null = null;
   for (const rawItem of o.items) {
     if (!rawItem || typeof rawItem !== 'object') return null;
     const i = rawItem as Record<string, unknown>;
@@ -46,12 +48,20 @@ function tryParse(raw: string): PlanProposalPayload | null {
     seen.add(i.id);
     if (typeof i.title !== 'string' || !i.title.trim()) return null;
     if (typeof i.priority !== 'string' || !VALID_PRIORITIES.has(i.priority as Priority)) return null;
+    let kind: 'work' | 'add_agent' = 'work';
+    if (i.kind !== undefined) {
+      if (typeof i.kind !== 'string' || !VALID_KINDS.has(i.kind)) return null;
+      kind = i.kind as 'work' | 'add_agent';
+    }
+    if (sharedKind === null) sharedKind = kind;
+    else if (sharedKind !== kind) return null; // mixed kinds not allowed
     items.push({
       id: i.id,
       title: i.title,
       detail: typeof i.detail === 'string' ? i.detail : undefined,
       priority: i.priority as Priority,
       suggestedAgent: typeof i.suggestedAgent === 'string' ? i.suggestedAgent : undefined,
+      kind,
     });
   }
   return { summary: o.summary, items };
