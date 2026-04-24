@@ -1136,6 +1136,30 @@ app.post('/api/projects', async (req, res) => {
   };
   projectsState.set(id, project);
   io.emit('project:created', project);
+
+  // Auto-create an empty default team for the new project so the user can
+  // start chatting with the orchestrator immediately. Only do this if no
+  // team is already attached to this project (a fresh project never has
+  // one, but keep the guard for safety).
+  const hasTeam = Array.from(teamsState.values()).some(t => t.projectId === id);
+  if (!hasTeam) {
+    const teamId = `team-${Date.now()}`;
+    const defProvider = defaultProvider();
+    const newTeam: Team = {
+      id: teamId,
+      name: project.name,
+      phase: 'planning',
+      status: 'planning',
+      agents: [],
+      projectId: id,
+      createdAt: new Date().toISOString(),
+      orchestratorProvider: defProvider,
+      orchestratorModel: defaultModelFor(defProvider),
+    };
+    teamsState.set(teamId, newTeam);
+    io.emit('team:created', newTeam);
+  }
+
   res.json(project);
 });
 
