@@ -1986,12 +1986,19 @@ import type { OrchestratorProvider } from '../../providers/types';
 interface TestAgent { id: string; role: string; name: string }
 interface TestTeam { id: string; name: string; projectId?: string; agents: TestAgent[]; orchestratorProvider: 'claude' | 'openai'; orchestratorModel: string }
 
+interface BuildAppCtx {
+  store: MessageStore;
+  adapter: ReturnType<typeof createExecutionAdapter>;
+}
+
 function buildApp(opts: {
   team: TestTeam;
   availableAgents: { name: string; description: string }[];
   providerReply: string;
   emitSpy?: (event: string, payload: unknown) => void;
-  onApprovedImpl?: (teamId: string, planMessageId: string, itemIds: string[]) => void;
+  // Factory receives store/adapter after they exist, so callers can close
+  // over them safely without TDZ gymnastics.
+  onApprovedFactory?: (ctx: BuildAppCtx) => (teamId: string, planMessageId: string, itemIds: string[]) => void;
 }) {
   const app = express();
   app.use(express.json());
@@ -2007,13 +2014,16 @@ function buildApp(opts: {
   const provider: OrchestratorProvider = {
     async streamTurn({ onChunk }) { onChunk(opts.providerReply); return { fullText: opts.providerReply }; },
   };
+  const onApproved = opts.onApprovedFactory
+    ? opts.onApprovedFactory({ store, adapter })
+    : () => {};
   app.use('/api/teams/:teamId/messages', createMessagesRouter({
     store,
     getTeam: () => opts.team,
     getProject: () => ({ id: 'p1', name: 'Smoke', path: '/tmp' }),
     getAvailableAgents: () => opts.availableAgents,
     getProvider: () => provider,
-    onApproved: opts.onApprovedImpl ?? (() => {}),
+    onApproved,
     emit: (event, payload) => {
       emits.push({ event, payload });
       opts.emitSpy?.(event, payload);
@@ -2040,28 +2050,27 @@ describe('intake → add_agent approval flow', () => {
       ],
     };
 
-    // onApproved body mirrors server.ts dispatchAgentAdds semantics.
-    const onApprovedImpl = vi.fn(async (teamId: string, planMessageId: string, itemIds: string[]) => {
-      void teamId;
-      const msg = store.findById(teamId, planMessageId);
-      if (!msg || msg.kind !== 'plan_proposal') return;
-      for (const item of msg.items.filter(i => itemIds.includes(i.id))) {
-        team.agents.push({
-          id: `agent-${Math.random().toString(36).slice(2, 9)}`,
-          role: item.title,
-          name: item.title.split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' '),
-        });
-      }
-      adapter.emitEvent(teamId, planMessageId, {
-        phase: 'team', status: 'completed',
-        detail: `Added: ${msg.items.filter(i => itemIds.includes(i.id)).map(i => i.title).join(', ')}`,
-      });
-    });
-
-    const { app, store, adapter, emits } = buildApp({
+    const approveSpy = vi.fn();
+    const { app, store, emits } = buildApp({
       team, availableAgents,
       providerReply: '```json\n' + JSON.stringify(plan) + '\n```',
-      onApprovedImpl: (a, b, c) => { void onApprovedImpl(a, b, c); },
+      // Factory closes over store/adapter AFTER buildApp creates them.
+      onApprovedFactory: ({ store: ctxStore, adapter: ctxAdapter }) => (teamId, planMessageId, itemIds) => {
+        approveSpy(teamId, planMessageId, itemIds);
+        const msg = ctxStore.findById(teamId, planMessageId);
+        if (!msg || msg.kind !== 'plan_proposal') return;
+        for (const item of msg.items.filter(i => itemIds.includes(i.id))) {
+          team.agents.push({
+            id: `agent-${Math.random().toString(36).slice(2, 9)}`,
+            role: item.title,
+            name: item.title.split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' '),
+          });
+        }
+        ctxAdapter.emitEvent(teamId, planMessageId, {
+          phase: 'team', status: 'completed',
+          detail: `Added: ${msg.items.filter(i => itemIds.includes(i.id)).map(i => i.title).join(', ')}`,
+        });
+      },
     });
 
     // Turn 1: user sends goal → provider replies with plan_proposal
@@ -2093,7 +2102,7 @@ describe('intake → add_agent approval flow', () => {
       .map(e => (e.payload as { message: { kind: string } }).message.kind);
     expect(emittedKinds).toContain('execution_status');
 
-    expect(onApprovedImpl).toHaveBeenCalled();
+    expect(approveSpy).toHaveBeenCalled();
   });
 });
 ```
@@ -2287,7 +2296,12 @@ Not a code task — the verification checklist before declaring done. Run from t
   - The sidebar team card now shows those agents with their role colors.
 - [ ] **Brief persisted locally** — reload `project.md` in the filesystem; confirm the user's intake messages are appended.
 - [ ] **Work proposal** — send *"Now draft the hero section"*. Expect a `plan_proposal` with `kind: 'work'` items. Approve two. Confirm execution_status rows appear, agents start running, and `data/projects/proj-<id>/tasks/<timestamp>-…md` contains a task entry.
-- [ ] **Notion-on (optional, requires `NOTION_TOKEN` + `NOTION_DATABASE_ID`)** — set env, restart backend, create a new project, and verify a project page appears in the configured Notion database and that approved work proposals create child pages under it.
+- [ ] **Notion-on (optional, requires `NOTION_TOKEN` + `NOTION_DATABASE_ID`)** — set env, restart backend, create a new project, and verify:
+  - A project page appears in the configured Notion database with the project name and metadata.
+  - After the first intake message, the project page's **Brief** section contains the message (via `appendProjectBlocks`).
+  - After approving the `add_agent` proposal, the page gains a **Team composition** heading + one bullet per added role.
+  - Approved work proposals create child pages under the project page (task ticket `parentPageId` is the project page id).
+  - Deleting the project archives the Notion page (it disappears from the default view but remains accessible via Notion's trash).
 - [ ] **Regression** — previously-created projects still load; old `Instruction.notionPageId` records (if any exist in persisted state) are rewritten to `docTicketRef` during `loadState`. Inspect `data/state.json` after one save-cycle to confirm.
 - [ ] **`checkAgentTodo` removal** — the old Notion flow auto-ticked per-agent to-do checkboxes on the task ticket when each agent completed. This plan drops that call (see Task 13 Step 2). If you have a past-approved task ticket in Notion, its to-do checkboxes will remain as you left them. Not a regression — intentional scope reduction; a replacement "progress per agent" section on both sinks is a follow-up.
 - [ ] **Empty-state hint** — the `CommandCenter` hint for empty teams is only visible while the thread is empty. Once the user sends the first message, the normal thread replaces it. Don't be surprised if you see it flash, then disappear.
@@ -2298,7 +2312,7 @@ If any step fails, **do not declare done** — triage and amend.
 
 ## Decisions / trade-offs locked in during planning
 
-- **Intake Q&A goes to `project.md` for local, nowhere for Notion v1.** Notion block-append is its own API surface (`blocks.children.append`). The spec treats docs as best-effort; local captures the full trail. Notion block-append is a clean follow-up, not blocking this plan.
+- **Intake Q&A and team composition are written to both sinks.** `NotionProjectDoc.appendBrief` and `appendTeamComposition` compose blocks and call `notion.blocks.children.append` via the new `appendProjectBlocks` helper. `LocalMarkdownProjectDoc` appends to `project.md`. Best-effort on both — a failed write logs and continues.
 - **`checkAgentTodo` dropped.** The per-agent to-do checkbox on Notion tickets was a nicety that doesn't port to local markdown cleanly. The task's to-do list can be added later on both sinks in a follow-up.
 - **Homogeneity enforcement lives in the parser**, not the dispatcher. Rejecting mixed items at parse time means the orchestrator can't accidentally send a mixed plan and have it silently bifurcate.
 - **`title` is the dispatch key for `add_agent` items.** `suggestedAgent` is ignored to avoid a fallback ladder. The prompt makes the contract explicit so the orchestrator puts the role in `title`.
