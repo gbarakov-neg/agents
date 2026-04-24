@@ -8,6 +8,7 @@ export interface PromptTeam {
 
 export interface PromptProject {
   id: string; name: string; path: string;
+  description?: string;
 }
 
 export type PromptAgentEntry = CatalogEntry;
@@ -34,6 +35,7 @@ export function buildOrchestratorPrompt(args: {
     const keywords = extractKeywords([
       ...userText,
       project.name,
+      ...(project.description ? [project.description] : []),
     ]);
     const { entries, truncated, noKeywordMatches } = filterCatalog(args.availableAgents!, keywords);
 
