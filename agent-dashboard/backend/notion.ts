@@ -22,47 +22,41 @@ export async function createTaskTicket(params: {
   projectName: string;
   instruction: string;
   agents: string[];
+  parentPageId?: string;
 }): Promise<string | null> {
   if (!notion || !databaseId) return null;
   try {
+    const parent: any = params.parentPageId
+      ? { page_id: params.parentPageId }
+      : { database_id: databaseId };
     const page = await notion.pages.create({
-      parent: { database_id: databaseId },
-      properties: {
-        'Name': { title: [{ text: { content: params.title } }] },
-        'Status': { select: { name: 'In Progress' } },
-        'Team': { rich_text: [{ text: { content: params.teamName } }] },
-        'Project': { rich_text: [{ text: { content: params.projectName } }] },
-      },
+      parent,
+      properties: params.parentPageId
+        ? { 'title': { title: [{ text: { content: params.title } }] } }
+        : {
+            'Name': { title: [{ text: { content: params.title } }] },
+            'Status': { select: { name: 'In Progress' } },
+            'Team': { rich_text: [{ text: { content: params.teamName } }] },
+            'Project': { rich_text: [{ text: { content: params.projectName } }] },
+          },
       children: [
-        {
-          object: 'block',
-          type: 'heading_2',
-          heading_2: { rich_text: [{ type: 'text', text: { content: 'Instruction' } }] }
-        },
-        {
-          object: 'block',
-          type: 'paragraph',
-          paragraph: { rich_text: [{ type: 'text', text: { content: params.instruction } }] }
-        },
-        {
-          object: 'block',
-          type: 'heading_2',
-          heading_2: { rich_text: [{ type: 'text', text: { content: 'Agents' } }] }
-        },
+        { object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Instruction' } }] } },
+        { object: 'block', type: 'paragraph',
+          paragraph: { rich_text: [{ type: 'text', text: { content: params.instruction } }] } },
+        { object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Agents' } }] } },
         ...params.agents.map(agent => ({
           object: 'block' as const,
           type: 'to_do' as const,
           to_do: {
             rich_text: [{ type: 'text' as const, text: { content: agent } }],
-            checked: false
-          }
+            checked: false,
+          },
         })),
-        {
-          object: 'block',
-          type: 'heading_2',
-          heading_2: { rich_text: [{ type: 'text', text: { content: 'Agent Reports' } }] }
-        },
-      ]
+        { object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Agent Reports' } }] } },
+      ],
     });
     return page.id;
   } catch (err) {
@@ -193,5 +187,75 @@ export async function checkAgentTodo(pageId: string, agentName: string): Promise
     }
   } catch (err) {
     console.error('Notion: failed to check todo:', err);
+  }
+}
+
+// Create a project page in the database
+export async function createProjectPage(input: {
+  name: string;
+  path: string;
+  url?: string;
+  description?: string;
+}): Promise<string | null> {
+  if (!notion || !databaseId) return null;
+  try {
+    const children: any[] = [
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: { rich_text: [
+          { type: 'text', text: { content: `Path: ${input.path}` } },
+        ] },
+      },
+    ];
+    if (input.url) children.push({
+      object: 'block', type: 'paragraph',
+      paragraph: { rich_text: [{ type: 'text', text: { content: `URL: ${input.url}` } }] },
+    });
+    if (input.description) children.push({
+      object: 'block', type: 'paragraph',
+      paragraph: { rich_text: [{ type: 'text', text: { content: input.description } }] },
+    });
+    children.push({ object: 'block', type: 'heading_2',
+      heading_2: { rich_text: [{ type: 'text', text: { content: 'Brief' } }] } });
+    children.push({ object: 'block', type: 'heading_2',
+      heading_2: { rich_text: [{ type: 'text', text: { content: 'Team composition' } }] } });
+
+    const page = await notion.pages.create({
+      parent: { database_id: databaseId },
+      properties: {
+        'Name': { title: [{ text: { content: `[Project] ${input.name}` } }] },
+        'Status': { select: { name: 'Active' } },
+      },
+      children,
+    });
+    return page.id;
+  } catch (err) {
+    console.error('Notion: failed to create project page:', err);
+    return null;
+  }
+}
+
+// Append blocks to an existing page
+export async function appendProjectBlocks(pageId: string, blocks: any[]): Promise<boolean> {
+  if (!notion) return false;
+  try {
+    await notion.blocks.children.append({ block_id: pageId, children: blocks });
+    return true;
+  } catch (err) {
+    console.error('Notion: failed to append blocks:', err);
+    return false;
+  }
+}
+
+// Archive (soft-delete) a project page
+export async function archiveProjectPage(pageId: string): Promise<boolean> {
+  if (!notion) return false;
+  try {
+    await notion.pages.update({ page_id: pageId, archived: true });
+    return true;
+  } catch (err) {
+    console.error('Notion: failed to archive page:', err);
+    return false;
   }
 }
