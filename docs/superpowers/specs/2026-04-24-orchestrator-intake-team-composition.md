@@ -48,6 +48,11 @@ export interface PlanProposalItem {
 
 **Homogeneity rule.** All items within a single `plan_proposal` must share the same `kind`. The server rejects mixed proposals at persist time (falls back to `text`, same path as other malformed payloads). This keeps the approve handler simple — no merging of dispatches.
 
+**Field semantics for `kind: 'add_agent'` items:**
+- `title` is authoritative — it MUST be an exact role name from the agent catalog. The dispatcher matches on `title` only.
+- `suggestedAgent` is ignored for `add_agent` items. The parser does not require it to be set; if it is set, it's kept in storage for display purposes but never consulted for dispatch. (Rationale: keeps the matching rule one-field-only, no fallback ambiguity.)
+- `detail` is free-form rationale shown to the user.
+
 ### Section 2 — Intake mode (orchestrator behavior)
 
 **Trigger:** When the POST `/messages` handler calls the provider, the prompt builder inspects `team.agents`. If `agents.length === 0`, the prompt switches to **intake mode**.
@@ -82,7 +87,7 @@ onApproved(teamId, planMessageId, itemIds)
 `dispatchAgentAdds` (new helper in `server.ts`):
 
 1. Look up each approved item's `title` against `availableAgents` (the plugin catalog). Skip items whose title is not a known role; emit a warning `execution_status` message.
-2. For each valid role, construct an `Agent` record mirroring the shape `CreateTeamModal`/`AddAgentModal` produce today — unique id, display name derived from the role, `status: 'idle'`, `progress: 0`, `plugin` from the catalog entry, `model` from the catalog entry's preferred model or the team's default.
+2. For each valid role, construct an `Agent` record mirroring the shape `CreateTeamModal`/`AddAgentModal` produce today — unique id, display name derived from the role, `status: 'idle'`, `progress: 0`, `plugin` from the catalog entry, `model` resolved as: the catalog entry's `model` field if set, else the team's `orchestratorModel`, else a hard-coded fallback (`sonnet`).
 3. Push them into `team.agents`, emit `team:updated`.
 4. Append an `execution_status` message tagged with the planMessageId: `{ phase: 'team', status: 'completed', detail: 'Added N agent(s): role-a, role-b' }` so the thread shows the effect inline.
 5. If Notion is enabled and the team has a `notionPageId` (see Section 5), append a "Team composition" block listing the agents and rationale.
@@ -148,7 +153,7 @@ export interface ProjectDocSink {
 
 Two implementations:
 
-- **`NotionProjectDoc`** — wraps `notion.ts`. Calls go to Notion's API. `createProject` creates a database page and stores the `pageId` keyed by `projectId`. All other methods look up the `pageId` and append blocks / create child pages (`createTaskTicket` becomes `appendTask` with `parent: page_id`). Existing `updateTicketStatus` / `appendAgentReport` map onto `updateTaskStatus` / `appendAgentReport`.
+- **`NotionProjectDoc`** — wraps `notion.ts`. `createProject` calls a **new function** `createProjectPage({ name, path, description?, url? })` that must be added to `notion.ts`; existing `createTaskTicket`, `updateTicketStatus`, `appendAgentReport` are reused. `createProjectPage` creates a database page and returns the `pageId`. The sink keeps an in-process map `projectId → pageId`. All other sink methods look up the `pageId` and either append blocks or create child pages (`appendTask` calls `createTaskTicket` with `parent: { page_id: <pageId> }`). `updateTaskStatus` → existing `updateTicketStatus`. `appendAgentReport` → existing `appendAgentReport`.
 - **`LocalMarkdownProjectDoc`** — writes markdown under `<DATA_DIR>/projects/<projectId>/` (DATA_DIR is the existing `agent-dashboard/backend/data/`). Layout:
   ```
   data/projects/<projectId>/
@@ -165,8 +170,8 @@ A **factory** `resolveProjectDoc()` picks the sink at call time based on `isNoti
 1. **On project create** (`POST /api/projects`): call `projectDoc.createProject(...)` after the in-memory project is registered.
 2. **On intake user message**: inside the `/messages` POST handler, after appending the user message, if `team.agents.length === 0` call `projectDoc.appendBrief(team.projectId, content)`. (Guard on `team.projectId` existing.)
 3. **On `add_agent` plan approved** (`dispatchAgentAdds`): call `projectDoc.appendTeamComposition(projectId, entries)`.
-4. **On `work` plan approved** (`dispatchApprovedPlan`): replace the existing direct `createTaskTicket` call with `projectDoc.appendTask(projectId, { title, items, agents })`. Store the returned `ticketRef` on the `Instruction` (reuses the existing `notionPageId` field — rename or add `docRef`).
-5. **On phase complete / agent report / execution finish**: the existing `appendAgentReport` / `updateTicketStatus` calls route through the sink. For local, these append to the task's markdown file. For Notion, unchanged behavior.
+4. **On `work` plan approved** (`dispatchApprovedPlan`): replace the existing direct `createTaskTicket` call with `projectDoc.appendTask(projectId, { title, items, agents })`. Store the returned `ticketRef` on the `Instruction` — the existing `Instruction.notionPageId` field is renamed to `docTicketRef`.
+5. **On phase complete / agent report / execution finish**: the existing `appendAgentReport` / `updateTicketStatus` calls route through the sink. If the Instruction has no `docTicketRef` (e.g. sink write failed earlier), `appendAgentReport` / `updateTaskStatus` are silent no-ops — matching the current behavior when `notionPageId` is null.
 
 #### 5c. Failure behavior
 
@@ -174,7 +179,9 @@ A **factory** `resolveProjectDoc()` picks the sink at call time based on `isNoti
 - Local write fails (disk full, permission) → log a warning. Same rule.
 - Disk usage is bounded only by the user's project count × task count. No automatic pruning in v1.
 
-**Project type:** `Project` gains `docRef?: string` (Notion `pageId`, or the local `data/projects/<id>/` path for symmetry). `Instruction.notionPageId` is renamed to `docTicketRef` (migration: accept both names when loading persisted state; old field is ignored after load).
+**Project type:** `Project` gains `docRef?: string` (Notion `pageId`, or the local `data/projects/<id>/` path for symmetry). `Instruction.notionPageId` is renamed to `docTicketRef`.
+
+**Persisted-state migration (small, explicit):** `loadState` in `server.ts` reads each instruction and, if the legacy `notionPageId` field is present and `docTicketRef` is absent, copies it over: `instr.docTicketRef = instr.notionPageId; delete instr.notionPageId`. This is a one-shot rewrite done at load time; no separate migration step. Same pattern is used for `Project.docRef` if any prior field existed (none did in v1, so this is strictly a forward-compat placeholder).
 
 **Environment variables:** unchanged — `NOTION_TOKEN` + `NOTION_DATABASE_ID` still gate Notion. When they're both absent, the factory returns `LocalMarkdownProjectDoc` instead of a no-op.
 
@@ -203,7 +210,7 @@ The frontend needs **no new components**. One small behavioral tweak in `Command
 **Backend unit:**
 
 - Parser: accept `kind: 'add_agent'`, reject mixed-kind item arrays, preserve existing behavior for kindless items (default 'work').
-- Prompt builder: intake mode fires at `agents.length === 0` + catalog present; normal mode otherwise; catalog truncation marker present at >80 entries.
+- Prompt builder: intake mode fires at `agents.length === 0` + catalog present; normal mode otherwise; relevance filter returns ≤ 40 entries; truncation marker present when pre-filter matches exceed 40; always-include core always present; fallback-only message when no keyword matches.
 - `dispatchAgentAdds`: adds listed agents, skips unknown roles with a warning, is idempotent on re-add.
 
 **Backend integration:**
@@ -223,7 +230,12 @@ The frontend needs **no new components**. One small behavioral tweak in `Command
 
 ## Migration
 
-No data migration. Additive: new optional fields (`PlanProposalItem.kind`, `Project.notionPageId`) are ignored when absent. Existing `plan_proposal` records persist fine.
+Additive schema changes:
+- `PlanProposalItem.kind` — optional; kindless items default to `work` at the parser level.
+- `Project.docRef` — optional; new field, absent on persisted state from prior runs (no-op).
+- `Instruction.docTicketRef` — renames `Instruction.notionPageId`. One-shot copy at `loadState` time (see Section 5c): if `notionPageId` is present on a loaded record and `docTicketRef` is absent, it's copied to `docTicketRef` and the old key is removed. Persisted state with only the new name is left as-is. No standalone migration script.
+
+Existing `plan_proposal` messages persist fine. No breaking changes to the wire format — the message envelope is identical byte-for-byte when `kind` isn't emitted.
 
 ## Open questions
 
