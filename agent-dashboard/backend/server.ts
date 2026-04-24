@@ -15,6 +15,7 @@ import { MessageStore } from './src/messages/store';
 import { createMessagesRouter } from './src/messages/router';
 import { createExecutionAdapter } from './src/messages/executionAdapter';
 import type { Message } from './src/messages/types';
+import { resolveProjectDoc } from './src/docs/factory';
 
 dotenv.config();
 
@@ -55,6 +56,7 @@ interface Project {
   url?: string;
   description?: string;
   createdAt: string;
+  docRef?: string;
 }
 
 interface Instruction {
@@ -157,6 +159,10 @@ const executionAdapter = createExecutionAdapter({
 
 const DATA_DIR = join(process.cwd(), 'data');
 const STATE_FILE = join(DATA_DIR, 'state.json');
+
+const projectDoc = resolveProjectDoc({
+  localRootDir: join(DATA_DIR, 'projects'),
+});
 
 interface PersistedState {
   projects: Project[];
@@ -1146,6 +1152,16 @@ app.post('/api/projects', async (req, res) => {
   projectsState.set(id, project);
   io.emit('project:created', project);
 
+  try {
+    await projectDoc.createProject({
+      projectId: id, name: project.name, path: project.path,
+      url: project.url, description: project.description,
+    });
+    project.docRef = `data/projects/${id}`; // purely informational for the frontend
+  } catch (err) {
+    console.warn('[projectDoc] createProject failed:', (err as Error).message);
+  }
+
   // Auto-create an empty default team for the new project so the user can
   // start chatting with the orchestrator immediately. Only do this if no
   // team is already attached to this project (a fresh project never has
@@ -1185,7 +1201,7 @@ app.patch('/api/projects/:projectId', (req, res) => {
   res.json(project);
 });
 
-app.delete('/api/projects/:projectId', (req, res) => {
+app.delete('/api/projects/:projectId', async (req, res) => {
   const projectId = req.params.projectId;
   projectsState.delete(projectId);
   // Unlink any teams that referenced this project so they don't orphan.
@@ -1196,6 +1212,13 @@ app.delete('/api/projects/:projectId', (req, res) => {
     }
   }
   io.emit('project:deleted', { projectId });
+
+  try {
+    await projectDoc.deleteProject(projectId);
+  } catch (err) {
+    console.warn('[projectDoc] deleteProject failed:', (err as Error).message);
+  }
+
   res.json({ ok: true });
 });
 

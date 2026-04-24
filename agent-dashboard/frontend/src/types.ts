@@ -13,6 +13,7 @@ export interface Project {
   url?: string;
   description?: string;
   createdAt: string;
+  docRef?: string;
 }
 
 export interface Instruction {
