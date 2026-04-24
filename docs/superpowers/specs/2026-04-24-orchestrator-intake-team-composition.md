@@ -13,10 +13,10 @@ Separately, Notion integration exists for per-instruction task tickets (`createT
 
 ## Goals
 
-1. When the active team has **zero agents**, the orchestrator's first response enters **intake mode**: asks 1–3 concise clarifying questions about what the user is building, constraints, tech stack.
+1. When the active team has **zero agents**, the orchestrator's first response enters **intake mode**: asks *as many clarifying questions as it needs* (no hard cap) about what the user is building, constraints, tech stack. The orchestrator decides when it has enough context.
 2. After enough context is captured, the orchestrator emits a `plan_proposal` whose items are **agent additions** (not work items). Approving selected items hydrates the team.
 3. After the team is composed, the orchestrator behaves normally — subsequent `plan_proposal` messages are work items and drive execution.
-4. When Notion is configured (`NOTION_TOKEN` + `NOTION_DATABASE_ID`), every project gets a **project page** in Notion. The intake brief, the composed team, and all approved work plans are appended to that page. Task tickets for work plans link back to the project page.
+4. **Project documentation is always written somewhere.** If Notion is configured, write to a per-project Notion page (brief, team composition, approved tasks, reports). If Notion is not configured, fall back to a **local markdown file** under the dashboard's data directory. Every project has a canonical document location.
 
 ## Non-goals (explicit)
 
@@ -54,17 +54,17 @@ export interface PlanProposalItem {
 
 **Intake-mode prompt additions** (appended to the existing orchestrator system prompt):
 
-> The team has no agents yet. Your job for the next few turns is to understand the project before proposing a team.
+> The team has no agents yet. Your job is to understand the project before proposing a team.
 >
-> - Ask 1–3 focused questions across turns to establish: what is being built, the target users, the tech stack or platform, and the most important constraints (deadlines, integrations, existing code to integrate with). Keep each turn short — one question per turn is fine.
-> - When you have enough context, emit a `plan_proposal` whose items recommend agents to add. Each item MUST have `"kind": "add_agent"` and `"title"` must be a valid agent role from the catalog below. Use `"detail"` to explain why this agent fits.
+> - Ask **as many focused questions as you need** to establish: what is being built, the target users, the tech stack or platform, and the most important constraints (deadlines, integrations, existing code to integrate with). One question per turn is ideal. There is no hard limit — don't rush to a team proposal before you're confident.
+> - When, and only when, you have enough context, emit a `plan_proposal` whose items recommend agents to add. Each item MUST have `"kind": "add_agent"` and `"title"` must be a valid agent role from the catalog below. Use `"detail"` to explain why this agent fits.
 > - Do NOT emit a `plan_proposal` with `kind: "work"` while the team is empty — work items require agents to dispatch.
 >
-> Agent catalog (use exact role strings):
+> Agent catalog (use exact role strings — these are the roles that look most relevant to what the user has described so far):
 > {name}: {short description, truncated to 80 chars}
-> … (catalog of `availableAgents`, sorted alphabetically)
+> … (filtered, relevance-ranked list — see Section 4)
 
-The agent catalog is injected as a bulleted list, capped at ~80 entries (the full plugin marketplace). For deployments with larger catalogs, the list is truncated and the prompt notes the truncation; future work: top-k relevance selection based on intake text.
+Catalog injection is **relevance-filtered**, not a static cap — see Section 4 for the ranking.
 
 **Normal mode prompt** (when `agents.length > 0`) is unchanged from the previous spec — the orchestrator proposes work or discusses.
 
@@ -89,7 +89,7 @@ onApproved(teamId, planMessageId, itemIds)
 
 No Claude subprocess is spawned. Adding agents is pure state mutation.
 
-### Section 4 — Prompt builder: catalog injection
+### Section 4 — Prompt builder: relevance-filtered catalog injection
 
 `buildOrchestratorPrompt` gains an optional `availableAgents` parameter:
 
@@ -109,28 +109,74 @@ buildOrchestratorPrompt(args: {
 
 Behavior:
 
-- If `team.agents.length === 0` and `availableAgents` is provided with ≥1 entry → emit intake-mode prompt with the catalog appended (capped at ~80 entries).
+- If `team.agents.length === 0` and `availableAgents` is provided with ≥1 entry → emit intake-mode prompt with a **relevance-filtered subset** of the catalog appended.
 - Else → emit the existing "normal mode" prompt.
 
-Router passes `availableAgents` from the server's in-memory catalog so the prompt builder doesn't need to know about `scanAgents()`.
+**Relevance filter** (pure function, no extra API calls):
 
-### Section 5 — Notion: per-project page
+1. **Extract keywords from the thread.** Concatenate the `content` of every `user`/`text` message + the project `name` + `description`. Lowercase. Drop stop words (common English filler — a short hard-coded list like `the, a, an, for, to, with, of, and, i, we, our, my, this, that, want, need, build, make`). Keep tokens of length ≥ 3.
+2. **Score each catalog entry.** For each entry in `availableAgents`, lowercase `name + description` and count how many distinct keywords match as substrings. Bonus of +2 if a keyword appears in `name` (name matches are stronger signal than description matches).
+3. **Always-include core.** A small hard-coded set of general-purpose roles always make the cut: `product-owner`, `backend-architect`, `frontend-developer`, `code-reviewer`, `security-auditor`, `test-automator`. These show up regardless of score so niche queries don't starve.
+4. **Result composition.** Take the top 30 entries by score (descending), union with the always-include core (deduplicated), sort alphabetically for stable output. If the resulting set is still < 40 entries, backfill with the highest-remaining-score entries up to 40.
+5. **Fallback when nothing matches.** If scoring yields zero keyword matches across the entire catalog (e.g., the user has only said "hi"), emit only the always-include core + a note: *"I have more agents in my catalog — tell me more about the project and I'll suggest specific ones."*
 
-Expand `notion.ts` with one new function and adjust the existing flow.
+Router passes the full `availableAgents` array; the builder does the filtering. Filter logic lives in the prompt builder (same module) and gets its own unit tests.
 
-**New:** `createProjectPage({ name, path, description?, url? })` → returns `{ pageId: string } | null`. Creates a Notion database page titled with the project name. If the database has a `Type` select property, set it to `Project`. If not, prefix the title with `[Project] `. Stores a page id.
+Caps:
+- Hard ceiling at 40 entries in the prompt to keep token cost bounded.
+- If the filtered set hits the ceiling and many more matched, the prompt notes "(N more agents available — narrow your ask if you need a different specialty)".
 
-**Mutations to existing `server.ts` Notion wiring:**
+### Section 5 — Project documentation: Notion or local-markdown fallback
 
-1. **On project create** (`POST /api/projects`): if Notion enabled, call `createProjectPage`, save `projectsState.get(id).notionPageId = pageId` (new optional field on `Project`).
-2. **On intake user message captured** (any `text` user message sent while team has `agents.length === 0`): append the message to the project page under a "Brief" block. Best-effort; a failure logs and moves on.
-3. **On `add_agent` plan approved** (inside `dispatchAgentAdds`): append a "Team composition" block listing the added agent roles + rationale.
-4. **On `work` plan approved** (inside `dispatchApprovedPlan`): the existing `createTaskTicket` call gains an optional `parentPageId` argument. If the project has a `notionPageId`, pass it so the task ticket becomes a child of the project page (Notion API supports `parent: { page_id: ... }` for creating sub-pages, OR a `Project` relation property if the DB has one — prefer relation; fall back to title link).
-5. **On execution complete**: unchanged — existing `updateTicketStatus` and `appendAgentReport` keep working.
+Every project gets a canonical documentation surface. The location depends on whether Notion is configured — the dashboard writes to **one or the other**, never both.
 
-**Environment variables**: unchanged — `NOTION_TOKEN` + `NOTION_DATABASE_ID` gate all writes via the existing `isNotionEnabled()`. No new env vars.
+#### 5a. Unified `ProjectDoc` interface
 
-**Project/Team types:** `Project` gains optional `notionPageId?: string`. `Team` already has no notion fields (per-instruction ticket tracking lives on `Instruction`).
+A small new module `agent-dashboard/backend/src/docs/projectDoc.ts` exposes:
+
+```ts
+export interface ProjectDocSink {
+  createProject(input: { projectId: string; name: string; path: string; url?: string; description?: string }): Promise<void>;
+  appendBrief(projectId: string, userMessage: string): Promise<void>;          // intake turn
+  appendTeamComposition(projectId: string, entries: { role: string; rationale: string }[]): Promise<void>;
+  appendTask(projectId: string, input: { title: string; items: string[]; agents: string[] }): Promise<{ ticketRef?: string }>;
+  updateTaskStatus(projectId: string, ticketRef: string, status: 'Done' | 'Failed'): Promise<void>;
+  appendAgentReport(projectId: string, ticketRef: string | undefined, report: AgentReport): Promise<void>;
+  deleteProject(projectId: string): Promise<void>;
+}
+```
+
+Two implementations:
+
+- **`NotionProjectDoc`** — wraps `notion.ts`. Calls go to Notion's API. `createProject` creates a database page and stores the `pageId` keyed by `projectId`. All other methods look up the `pageId` and append blocks / create child pages (`createTaskTicket` becomes `appendTask` with `parent: page_id`). Existing `updateTicketStatus` / `appendAgentReport` map onto `updateTaskStatus` / `appendAgentReport`.
+- **`LocalMarkdownProjectDoc`** — writes markdown under `<DATA_DIR>/projects/<projectId>/` (DATA_DIR is the existing `agent-dashboard/backend/data/`). Layout:
+  ```
+  data/projects/<projectId>/
+    project.md          ← front matter (name, path, url, description) + intake brief + team composition
+    tasks/
+      <timestamp>-<slug>.md   ← one file per approved work plan; status header + reports appended
+  ```
+  `ticketRef` for local is the relative file path (e.g. `tasks/20260424T094212-landing-page.md`). Writes are append-only and atomic (`fs.appendFile`).
+
+A **factory** `resolveProjectDoc()` picks the sink at call time based on `isNotionEnabled()`. No global state; easy to swap if the user enables Notion later — existing local docs aren't migrated, but new writes go to Notion. (Migration is a follow-up.)
+
+#### 5b. Call sites in `server.ts`
+
+1. **On project create** (`POST /api/projects`): call `projectDoc.createProject(...)` after the in-memory project is registered.
+2. **On intake user message**: inside the `/messages` POST handler, after appending the user message, if `team.agents.length === 0` call `projectDoc.appendBrief(team.projectId, content)`. (Guard on `team.projectId` existing.)
+3. **On `add_agent` plan approved** (`dispatchAgentAdds`): call `projectDoc.appendTeamComposition(projectId, entries)`.
+4. **On `work` plan approved** (`dispatchApprovedPlan`): replace the existing direct `createTaskTicket` call with `projectDoc.appendTask(projectId, { title, items, agents })`. Store the returned `ticketRef` on the `Instruction` (reuses the existing `notionPageId` field — rename or add `docRef`).
+5. **On phase complete / agent report / execution finish**: the existing `appendAgentReport` / `updateTicketStatus` calls route through the sink. For local, these append to the task's markdown file. For Notion, unchanged behavior.
+
+#### 5c. Failure behavior
+
+- Notion call fails → log a warning (`console.warn('[notion] ...')`), do NOT fall back to local (the user expected Notion; silent divergence is worse than a missing entry). Dashboard continues to function.
+- Local write fails (disk full, permission) → log a warning. Same rule.
+- Disk usage is bounded only by the user's project count × task count. No automatic pruning in v1.
+
+**Project type:** `Project` gains `docRef?: string` (Notion `pageId`, or the local `data/projects/<id>/` path for symmetry). `Instruction.notionPageId` is renamed to `docTicketRef` (migration: accept both names when loading persisted state; old field is ignored after load).
+
+**Environment variables:** unchanged — `NOTION_TOKEN` + `NOTION_DATABASE_ID` still gate Notion. When they're both absent, the factory returns `LocalMarkdownProjectDoc` instead of a no-op.
 
 ### Section 6 — UI: minor adjustment
 
@@ -148,7 +194,9 @@ The frontend needs **no new components**. One small behavioral tweak in `Command
 - **Team pre-loaded with agents** (e.g. via `CreateTeamModal` before first chat) → intake mode never fires. Orchestrator is in normal mode from turn one.
 - **Notion disabled mid-session** → any notion call early-returns; no error messages in the thread.
 - **Notion `createProjectPage` fails** → logged; project creation still succeeds; downstream writes that reference the missing `notionPageId` early-return.
-- **Catalog truncation** → the prompt notes "(… and N more agents; ask the user what domain they need and I'll suggest the right role)".
+- **Catalog truncation** → the prompt notes "(N more agents available — narrow your ask if you need a different specialty)". Applies when the relevance filter produces more than the 40-entry hard ceiling.
+- **Local docs** → if a project's local docs directory is deleted externally (e.g. user rm's `data/projects/<id>/`), the next write silently re-creates it; no attempt to detect external deletion.
+- **Project deletion** → `DELETE /api/projects/:id` already unlinks teams. Extend to also call `projectDoc.deleteProject(id)` which deletes the local directory or archives the Notion page (Notion archive, not hard delete).
 
 ### Section 8 — Testing
 
@@ -179,15 +227,18 @@ No data migration. Additive: new optional fields (`PlanProposalItem.kind`, `Proj
 
 ## Open questions
 
-1. **Agent-catalog truncation threshold.** 80 feels arbitrary but the full catalog (~180 roles) would bloat every turn's prompt. Options: (a) static cap, (b) simple substring filter based on the user's first message, (c) embedding-based top-k. Recommend (a) for v1; revisit if the orchestrator starts hallucinating roles.
+None at this draft — all prior questions resolved during brainstorming:
 
-2. **Add-agent approvals and model selection.** Each agent catalog entry has a preferred `model` (sonnet/haiku/opus). `dispatchAgentAdds` uses the catalog default. Should the user be able to override model at approve time? Nice-to-have; skip in v1.
-
-3. **Re-entering intake mode.** If the user deletes all agents from an existing team, should the orchestrator re-enter intake? Current design: yes — it's based on live state, not a one-shot flag. Low cost, safe default.
+- **Intake turn cap**: none. Orchestrator decides when it has enough context.
+- **Catalog filter**: keyword-score + always-include core + 40-entry hard ceiling (Section 4).
+- **Per-agent model override at approve time**: out of scope for v1; dispatcher uses catalog default.
+- **Re-intake on emptied team**: allowed — it fires any time `team.agents.length === 0`. When a project is deleted, the team is deleted or unlinked by the existing cascade, so no orphan re-intake.
 
 ## Follow-ups (explicitly deferred)
 
-- **Top-k catalog relevance** via keywords or embeddings — v2 when catalogs exceed ~200 entries.
-- **"Team proposal" visual distinction** on `PlanProposalCard` — label + icon.
+- **"Team proposal" visual distinction** on `PlanProposalCard` — label + icon to distinguish `kind: 'add_agent'` visually.
+- **Embedding-based catalog relevance** — v2 if the keyword filter starts missing obviously-relevant agents.
 - **Two-way Notion sync** — pull edits from the project page back into the dashboard.
-- **Per-project Notion database** rather than tagging within one DB.
+- **Local → Notion migration** — when a user enables Notion after accumulating local docs, offer a one-shot migration that uploads existing local markdown as Notion pages.
+- **Local doc pruning / archival** — not in v1; disk grows unbounded with approved tasks.
+- **Dedicated Notion database per project** — simpler UX but requires `createDatabase` permission.
