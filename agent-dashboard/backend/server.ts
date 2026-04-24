@@ -9,7 +9,7 @@ import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { initNotion, isNotionEnabled, createTaskTicket, updateTicketStatus, appendAgentReport, checkAgentTodo } from './notion.js';
+import { initNotion } from './notion.js';
 import { defaultProvider, defaultModelFor, resolveProvider } from './src/providers/factory';
 import { MessageStore } from './src/messages/store';
 import { createMessagesRouter } from './src/messages/router';
@@ -730,21 +730,19 @@ async function executePlanAndPhases(
   instructionObj?: Instruction, planMessageId?: string
 ) {
 
-  // Create Notion ticket
-  let docTicketRef: string | null = null;
-  if (isNotionEnabled()) {
-    const projectName = project.name;
-    docTicketRef = await createTaskTicket({
+  // Create project doc task entry
+  let docTicketRef: string | undefined;
+  try {
+    const result = await projectDoc.appendTask(project.id, {
       title: instruction.substring(0, 100),
-      teamName: team.name,
-      projectName,
-      instruction,
-      agents: team.agents.map(a => a.name)
+      items: [instruction],
+      agents: team.agents.map(a => a.name),
     });
-    if (docTicketRef && instructionObj) {
-      instructionObj.docTicketRef = docTicketRef;
-    }
-    if (docTicketRef) addLog(team.id, undefined, 'info', 'Notion: ticket created');
+    docTicketRef = result.ticketRef;
+    if (docTicketRef && instructionObj) instructionObj.docTicketRef = docTicketRef;
+    if (docTicketRef) addLog(team.id, undefined, 'info', 'Project doc: task entry created');
+  } catch (err) {
+    console.warn('[projectDoc] appendTask failed:', (err as Error).message);
   }
 
   // Phase 1: Planning
@@ -795,18 +793,20 @@ async function executePlanAndPhases(
 
       addLog(team.id, agent.id, 'info', `Report: ${report.summary}`);
 
-      // Push to Notion
-      if (docTicketRef) {
-        await appendAgentReport(docTicketRef, {
+      // Push to project doc
+      try {
+        await projectDoc.appendAgentReport(project.id, docTicketRef, {
           agentName: report.agentName,
           role: report.role,
           task: report.task,
           status: report.status,
-          output: agent.output || '',
+          output: agent.output,
           filesChanged: report.filesChanged,
-          reasoning: report.reasoning
+          reasoning: report.reasoning,
+          summary: report.summary,
         });
-        await checkAgentTodo(docTicketRef, agent.name);
+      } catch (err) {
+        console.warn('[projectDoc] appendAgentReport failed:', (err as Error).message);
       }
 
       // Emit report to frontend
@@ -822,11 +822,13 @@ async function executePlanAndPhases(
     addLog(team.id, undefined, 'info', `Orchestrator: phase "${phase.name}" complete`);
   }
 
-  // Update Notion ticket status
-  if (docTicketRef) {
+  // Update project doc task status
+  try {
     const anyFailed = team.agents.some(a => a.status === 'failed');
-    await updateTicketStatus(docTicketRef, anyFailed ? 'Failed' : 'Done');
-    addLog(team.id, undefined, 'info', `Notion: ticket updated to ${anyFailed ? 'Failed' : 'Done'}`);
+    await projectDoc.updateTaskStatus(project.id, docTicketRef, anyFailed ? 'Failed' : 'Done');
+    addLog(team.id, undefined, 'info', `Project doc: task marked ${anyFailed ? 'Failed' : 'Done'}`);
+  } catch (err) {
+    console.warn('[projectDoc] updateTaskStatus failed:', (err as Error).message);
   }
 
   // Post summary to chat
@@ -1306,7 +1308,7 @@ app.get('/api/teams/:teamId/agents/:agentId/output', (req, res) => {
 
 // Notion config endpoint
 app.get('/api/notion/status', (_req, res) => {
-  res.json({ enabled: isNotionEnabled() });
+  res.json({ enabled: !!(process.env.NOTION_TOKEN && process.env.NOTION_DATABASE_ID) });
 });
 
 app.post('/api/notion/configure', (req, res) => {
