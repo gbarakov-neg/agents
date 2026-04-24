@@ -65,7 +65,7 @@ interface Instruction {
   status: 'pending' | 'acknowledged' | 'executing' | 'done' | 'failed' | 'clarifying';
   createdAt: string;
   acknowledgedAt?: string;
-  notionPageId?: string;
+  docTicketRef?: string;
   clarifyingQuestions?: string;
 }
 
@@ -216,7 +216,15 @@ async function loadState() {
       }
       teamsState.set(t.id, t);
     }
-    instructionsState.push(...(data.instructions || []));
+    for (const instr of (data.instructions || [])) {
+      // Migrate legacy Instruction.notionPageId -> docTicketRef at load time.
+      const legacy = instr as unknown as { notionPageId?: string; docTicketRef?: string };
+      if (legacy.notionPageId && !legacy.docTicketRef) {
+        legacy.docTicketRef = legacy.notionPageId;
+        delete legacy.notionPageId;
+      }
+      instructionsState.push(instr);
+    }
     // Reset any executing instructions to pending (agents were killed on restart)
     for (const instr of instructionsState) {
       if (instr.status === 'executing' || instr.status === 'pending') {
@@ -717,20 +725,20 @@ async function executePlanAndPhases(
 ) {
 
   // Create Notion ticket
-  let notionPageId: string | null = null;
+  let docTicketRef: string | null = null;
   if (isNotionEnabled()) {
     const projectName = project.name;
-    notionPageId = await createTaskTicket({
+    docTicketRef = await createTaskTicket({
       title: instruction.substring(0, 100),
       teamName: team.name,
       projectName,
       instruction,
       agents: team.agents.map(a => a.name)
     });
-    if (notionPageId && instructionObj) {
-      instructionObj.notionPageId = notionPageId;
+    if (docTicketRef && instructionObj) {
+      instructionObj.docTicketRef = docTicketRef;
     }
-    if (notionPageId) addLog(team.id, undefined, 'info', 'Notion: ticket created');
+    if (docTicketRef) addLog(team.id, undefined, 'info', 'Notion: ticket created');
   }
 
   // Phase 1: Planning
@@ -782,8 +790,8 @@ async function executePlanAndPhases(
       addLog(team.id, agent.id, 'info', `Report: ${report.summary}`);
 
       // Push to Notion
-      if (notionPageId) {
-        await appendAgentReport(notionPageId, {
+      if (docTicketRef) {
+        await appendAgentReport(docTicketRef, {
           agentName: report.agentName,
           role: report.role,
           task: report.task,
@@ -792,7 +800,7 @@ async function executePlanAndPhases(
           filesChanged: report.filesChanged,
           reasoning: report.reasoning
         });
-        await checkAgentTodo(notionPageId, agent.name);
+        await checkAgentTodo(docTicketRef, agent.name);
       }
 
       // Emit report to frontend
@@ -809,9 +817,9 @@ async function executePlanAndPhases(
   }
 
   // Update Notion ticket status
-  if (notionPageId) {
+  if (docTicketRef) {
     const anyFailed = team.agents.some(a => a.status === 'failed');
-    await updateTicketStatus(notionPageId, anyFailed ? 'Failed' : 'Done');
+    await updateTicketStatus(docTicketRef, anyFailed ? 'Failed' : 'Done');
     addLog(team.id, undefined, 'info', `Notion: ticket updated to ${anyFailed ? 'Failed' : 'Done'}`);
   }
 
@@ -821,7 +829,7 @@ async function executePlanAndPhases(
   const allResults = resultsState.filter(r => r.teamId === team.id && r.report);
   const chatSummary = `## Task Complete\n\n${completedAgents.length} agent(s) succeeded, ${failedAgents.length} failed.\n\n` +
     allResults.slice(-team.agents.length).map(r => r.report ? `**${r.report.agentName}**: ${r.report.summary}` : '').filter(Boolean).join('\n\n') +
-    (notionPageId ? '\n\n📋 Notion ticket has been updated with full reports.' : '');
+    (docTicketRef ? '\n\n📋 Notion ticket has been updated with full reports.' : '');
 
   {
     const msg = {
