@@ -686,6 +686,64 @@ Respond with ONLY valid JSON:
   });
 }
 
+async function dispatchAgentAdds(teamId: string, planMessageId: string, itemIds: string[]) {
+  const team = teamsState.get(teamId);
+  if (!team) return;
+  const planMsg = messageStore.findById(teamId, planMessageId);
+  if (!planMsg || planMsg.kind !== 'plan_proposal') return;
+
+  const approved = planMsg.items.filter(i => itemIds.includes(i.id));
+  const added: { role: string; rationale: string }[] = [];
+  const skippedUnknown: string[] = [];
+  const skippedDup: string[] = [];
+
+  for (const item of approved) {
+    const role = item.title;
+    const catalog = availableAgents.find(a => a.name === role);
+    if (!catalog) { skippedUnknown.push(role); continue; }
+    if (team.agents.some(a => a.role === role)) { skippedDup.push(role); continue; }
+
+    const displayName = role.split('-')
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    const modelChoice = catalog.model && catalog.model !== 'inherit'
+      ? catalog.model
+      : (team.orchestratorModel || 'sonnet');
+    const newAgent: Agent = {
+      id: `agent-${Math.random().toString(36).slice(2, 11)}`,
+      name: displayName,
+      role,
+      status: 'idle',
+      progress: 0,
+      model: modelChoice,
+      plugin: catalog.plugin,
+    };
+    team.agents.push(newAgent);
+    added.push({ role, rationale: item.detail ?? '' });
+  }
+
+  io.emit('team:updated', team);
+
+  // Emit an execution_status row describing the effect (shown inline in the thread).
+  const detailParts: string[] = [];
+  if (added.length) detailParts.push(`Added: ${added.map(a => a.role).join(', ')}`);
+  if (skippedUnknown.length) detailParts.push(`Skipped (unknown role): ${skippedUnknown.join(', ')}`);
+  if (skippedDup.length) detailParts.push(`Skipped (already on team): ${skippedDup.join(', ')}`);
+  executionAdapter.emitEvent(teamId, planMessageId, {
+    phase: 'team',
+    status: added.length > 0 ? 'completed' : 'failed',
+    detail: detailParts.join(' · ') || 'No changes',
+  });
+
+  // Persist to project doc if the team has a project
+  if (team.projectId && added.length > 0) {
+    try {
+      await projectDoc.appendTeamComposition(team.projectId, added);
+    } catch (err) {
+      console.warn('[projectDoc] appendTeamComposition failed:', (err as Error).message);
+    }
+  }
+}
+
 async function dispatchApprovedPlan(teamId: string, planMessageId: string, itemIds: string[]) {
   const team = teamsState.get(teamId);
   if (!team || !team.projectId) return;
@@ -1108,9 +1166,34 @@ app.use('/api/teams/:teamId/messages', createMessagesRouter({
     { projectPath: project.path },
   ),
   onApproved: (teamId, planMessageId, itemIds) => {
-    dispatchApprovedPlan(teamId, planMessageId, itemIds).catch(err => console.error('dispatch failed', err));
+    const msg = messageStore.findById(teamId, planMessageId);
+    if (!msg || msg.kind !== 'plan_proposal') return;
+    const approvedItems = msg.items.filter(i => itemIds.includes(i.id));
+    const kind = approvedItems[0]?.kind ?? 'work';
+    if (kind === 'add_agent') {
+      dispatchAgentAdds(teamId, planMessageId, itemIds)
+        .catch(err => console.error('dispatch agents failed', err));
+    } else {
+      dispatchApprovedPlan(teamId, planMessageId, itemIds)
+        .catch(err => console.error('dispatch plan failed', err));
+    }
   },
-  emit: (event, payload) => io.emit(event, payload),
+  emit: (event, payload) => {
+    io.emit(event, payload);
+    if (event === 'chat:message') {
+      const p = payload as { teamId: string; message: { role: string; kind: string; content?: string } };
+      const team = teamsState.get(p.teamId);
+      if (
+        team && team.projectId &&
+        team.agents.length === 0 &&
+        p.message.role === 'user' && p.message.kind === 'text' &&
+        typeof p.message.content === 'string' && p.message.content.trim().length > 0
+      ) {
+        projectDoc.appendBrief(team.projectId, p.message.content).catch(err =>
+          console.warn('[projectDoc] appendBrief failed:', (err as Error).message));
+      }
+    }
+  },
 }));
 
 // ============================================================
