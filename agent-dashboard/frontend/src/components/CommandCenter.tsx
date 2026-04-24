@@ -120,6 +120,15 @@ export default function CommandCenter({
           ) : (
             <MessageThread messages={messages} onApprove={approve} />
           )}
+          {streaming && (
+            <div className="flex justify-start mt-2" aria-label="Orchestrator is thinking">
+              <div className="bg-gray-700/80 text-gray-200 rounded-lg px-3 py-2 flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '0ms' }} />
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '180ms' }} />
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '360ms' }} />
+              </div>
+            </div>
+          )}
         </div>
         <textarea
           value={input}
