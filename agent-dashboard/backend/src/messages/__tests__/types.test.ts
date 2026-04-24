@@ -30,4 +30,19 @@ describe('Message types', () => {
     };
     expect(m.planMessageId).toBe('p1');
   });
+
+  it('accepts a plan_proposal item with kind=add_agent', () => {
+    const item: PlanProposalItem = {
+      id: 'i2', title: 'frontend-developer', priority: 'high',
+      kind: 'add_agent',
+    };
+    expect(item.kind).toBe('add_agent');
+  });
+
+  it('defaults an item without kind to undefined (treated as work downstream)', () => {
+    const item: PlanProposalItem = {
+      id: 'i3', title: 'task', priority: 'low',
+    };
+    expect(item.kind).toBeUndefined();
+  });
 });
