@@ -742,6 +742,23 @@ async function dispatchAgentAdds(teamId: string, planMessageId: string, itemIds:
       console.warn('[projectDoc] appendTeamComposition failed:', (err as Error).message);
     }
   }
+
+  // Nudge the user: team's composed; ask whether to proceed. The next user
+  // reply re-enters the normal orchestrator turn, which (with a non-empty
+  // team now) will emit a work plan_proposal rather than another team one.
+  if (added.length > 0) {
+    const followUp: Message = {
+      id: randomUUID(),
+      role: 'assistant',
+      kind: 'text',
+      content:
+        `Team's ready — ${added.map(a => a.role).join(', ')} added. ` +
+        `Want me to start building now, or do you want to refine the plan first?`,
+      createdAt: new Date().toISOString(),
+    };
+    messageStore.append(teamId, followUp);
+    io.emit('chat:message', { teamId, message: followUp });
+  }
 }
 
 async function dispatchApprovedPlan(teamId: string, planMessageId: string, itemIds: string[]) {
