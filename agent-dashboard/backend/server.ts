@@ -220,6 +220,11 @@ async function loadState() {
           a.currentTask = undefined;
         }
       }
+      // Migrate legacy auto-created teams that used 'planning' as their initial
+      // status — that left Pause/Resume disabled in the UI. Bump to 'active'
+      // so the controls work; status flips to 'paused' / 'complete' via the
+      // existing endpoints.
+      if (t.status === 'planning') t.status = 'active';
       teamsState.set(t.id, t);
     }
     for (const instr of (data.instructions || [])) {
@@ -1276,7 +1281,7 @@ app.post('/api/projects', async (req, res) => {
       id: teamId,
       name: project.name,
       phase: 'planning',
-      status: 'planning',
+      status: 'active',
       agents: [],
       projectId: id,
       createdAt: new Date().toISOString(),
